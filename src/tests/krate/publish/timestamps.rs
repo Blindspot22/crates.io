@@ -1,23 +1,24 @@
 #[tokio::test(flavor = "multi_thread")]
 async fn uploading_new_version_touches_crate() {
-    use crate::builders::PublishBuilder;
-    use crate::util::{RequestHelper, TestApp};
-    use crate::CrateResponse;
-    use crates_io::schema::crates;
+    use crate::schema::crates;
+    use crate::tests::builders::PublishBuilder;
+    use crate::tests::util::{RequestHelper, TestApp};
+    use crate::tests::CrateResponse;
     use diesel::dsl::*;
-    use diesel::{ExpressionMethods, RunQueryDsl};
+    use diesel::ExpressionMethods;
+    use diesel_async::RunQueryDsl;
 
     let (app, _, user) = TestApp::full().with_user();
+    let mut conn = app.async_db_conn().await;
 
     let crate_to_publish = PublishBuilder::new("foo_versions_updated_at", "1.0.0");
     user.publish_crate(crate_to_publish).await.good();
 
-    app.db(|conn| {
-        diesel::update(crates::table)
-            .set(crates::updated_at.eq(crates::updated_at - 1.hour()))
-            .execute(conn)
-            .unwrap();
-    });
+    diesel::update(crates::table)
+        .set(crates::updated_at.eq(crates::updated_at - 1.hour()))
+        .execute(&mut conn)
+        .await
+        .unwrap();
 
     let json: CrateResponse = user.show_crate("foo_versions_updated_at").await;
     let updated_at_before = json.krate.updated_at;

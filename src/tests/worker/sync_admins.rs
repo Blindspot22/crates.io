@@ -1,12 +1,12 @@
-use crate::util::TestApp;
-use crates_io::schema::{emails, users};
-use crates_io::team_repo::{MockTeamRepo, Permission, Person};
-use crates_io::worker::jobs::SyncAdmins;
+use crate::schema::{emails, users};
+use crate::tests::util::TestApp;
+use crate::worker::jobs::SyncAdmins;
+use crates_io_team_repo::{MockTeamRepo, Permission, Person};
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
-use diesel::{PgConnection, QueryResult, RunQueryDsl};
-use insta::assert_debug_snapshot;
-use regex::Regex;
+use diesel::QueryResult;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use insta::assert_snapshot;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sync_admins_job() {
@@ -23,39 +23,38 @@ async fn test_sync_admins_job() {
         .returning(move |_| Ok(mock_response.clone()));
 
     let (app, _) = TestApp::full().with_team_repo(team_repo).empty();
+    let mut conn = app.async_db_conn().await;
 
-    app.db(|conn| create_user("existing-admin", 1, true, conn).unwrap());
-    app.db(|conn| create_user("obsolete-admin", 2, true, conn).unwrap());
-    app.db(|conn| create_user("new-admin", 3, false, conn).unwrap());
-    app.db(|conn| create_user("unrelated-user", 42, false, conn).unwrap());
+    create_user("existing-admin", 1, true, &mut conn)
+        .await
+        .unwrap();
+    create_user("obsolete-admin", 2, true, &mut conn)
+        .await
+        .unwrap();
+    create_user("new-admin", 3, false, &mut conn).await.unwrap();
+    create_user("unrelated-user", 42, false, &mut conn)
+        .await
+        .unwrap();
 
-    let admins = app.db(|conn| get_admins(conn).unwrap());
+    let admins = get_admins(&mut conn).await.unwrap();
     let expected_admins = vec![("existing-admin".into(), 1), ("obsolete-admin".into(), 2)];
     assert_eq!(admins, expected_admins);
 
-    app.db(|conn| SyncAdmins.enqueue(conn).unwrap());
+    SyncAdmins.async_enqueue(&mut conn).await.unwrap();
     app.run_pending_background_jobs().await;
 
-    let admins = app.db(|conn| get_admins(conn).unwrap());
+    let admins = get_admins(&mut conn).await.unwrap();
     let expected_admins = vec![("existing-admin".into(), 1), ("new-admin".into(), 3)];
     assert_eq!(admins, expected_admins);
 
-    let email_header_regex = Regex::new(r"(Message-ID|Date): [^\r\n]+\r\n").unwrap();
-    let emails = app.as_inner().emails.mails_in_memory().unwrap();
-    let emails = emails
-        .iter()
-        .map(|(_, email)| email_header_regex.replace_all(email, ""))
-        .collect::<Vec<_>>();
-
-    assert_debug_snapshot!(emails);
+    assert_snapshot!(app.emails_snapshot());
 
     // Run the job again to verify that no new emails are sent
     // for `new-admin-without-account`.
-    app.db(|conn| SyncAdmins.enqueue(conn).unwrap());
+    SyncAdmins.async_enqueue(&mut conn).await.unwrap();
     app.run_pending_background_jobs().await;
 
-    let emails = app.as_inner().emails.mails_in_memory().unwrap();
-    assert_eq!(emails.len(), 2);
+    assert_eq!(app.emails().len(), 2);
 }
 
 fn mock_permission(people: Vec<Person>) -> Permission {
@@ -72,7 +71,12 @@ fn mock_person(name: impl Into<String>, github_id: i32) -> Person {
     }
 }
 
-fn create_user(name: &str, gh_id: i32, is_admin: bool, conn: &mut PgConnection) -> QueryResult<()> {
+async fn create_user(
+    name: &str,
+    gh_id: i32,
+    is_admin: bool,
+    conn: &mut AsyncPgConnection,
+) -> QueryResult<()> {
     let user_id = diesel::insert_into(users::table)
         .values((
             users::name.eq(name),
@@ -82,7 +86,8 @@ fn create_user(name: &str, gh_id: i32, is_admin: bool, conn: &mut PgConnection) 
             users::is_admin.eq(is_admin),
         ))
         .returning(users::id)
-        .get_result::<i32>(conn)?;
+        .get_result::<i32>(conn)
+        .await?;
 
     diesel::insert_into(emails::table)
         .values((
@@ -90,15 +95,17 @@ fn create_user(name: &str, gh_id: i32, is_admin: bool, conn: &mut PgConnection) 
             emails::email.eq(format!("{}@crates.io", name)),
             emails::verified.eq(true),
         ))
-        .execute(conn)?;
+        .execute(conn)
+        .await?;
 
     Ok(())
 }
 
-fn get_admins(conn: &mut PgConnection) -> QueryResult<Vec<(String, i32)>> {
+async fn get_admins(conn: &mut AsyncPgConnection) -> QueryResult<Vec<(String, i32)>> {
     users::table
         .select((users::gh_login, users::gh_id))
         .filter(users::is_admin.eq(true))
         .order(users::gh_id.asc())
         .get_results(conn)
+        .await
 }

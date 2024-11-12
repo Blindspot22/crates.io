@@ -19,21 +19,21 @@
 //! `MockCookieUser` and `MockTokenUser` provide an `as_model` function which returns a reference
 //! to the underlying database model value (`User` and `ApiToken` respectively).
 
-use crate::{
+use crate::middleware::session;
+use crate::models::{ApiToken, CreatedApiToken, User};
+use crate::tests::{
     CategoryListResponse, CategoryResponse, CrateList, CrateResponse, GoodCrate, OkBool,
     OwnersResponse, VersionResponse,
 };
-use crates_io::middleware::session;
-use crates_io::models::{ApiToken, CreatedApiToken, User};
 
 use http::{Method, Request};
 
+use crate::models::token::{CrateScope, EndpointScope};
+use crate::util::token::PlainToken;
 use axum::body::{Body, Bytes};
 use axum::extract::connect_info::MockConnectInfo;
 use chrono::NaiveDateTime;
 use cookie::Cookie;
-use crates_io::models::token::{CrateScope, EndpointScope};
-use crates_io::util::token::PlainToken;
 use http::header;
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
@@ -41,14 +41,13 @@ use std::net::SocketAddr;
 use tower::ServiceExt;
 
 mod chaosproxy;
-mod github;
+pub mod github;
 pub mod insta;
 pub mod matchers;
 mod mock_request;
 mod response;
 mod test_app;
 
-pub(crate) use chaosproxy::ChaosProxy;
 use mock_request::MockRequest;
 pub use mock_request::MockRequestExt;
 pub use response::Response;
@@ -86,6 +85,7 @@ pub fn encode_session_header(session_key: &cookie::Key, user_id: i32) -> String 
 /// A collection of helper methods for the 3 authentication types
 ///
 /// Helper methods go through public APIs, and should not modify the database directly
+#[allow(async_fn_in_trait)]
 pub trait RequestHelper {
     fn request_builder(&self, method: Method, path: &str) -> MockRequest;
     fn app(&self) -> &TestApp;
@@ -138,6 +138,20 @@ pub trait RequestHelper {
         let is_json = body.starts_with(b"{") && body.ends_with(b"}");
 
         let mut request = self.request_builder(Method::PUT, path);
+        *request.body_mut() = body;
+        if is_json {
+            request.header(header::CONTENT_TYPE, "application/json");
+        }
+
+        self.run(request).await
+    }
+
+    /// Issue a PATCH request
+    async fn patch<T>(&self, path: &str, body: impl Into<Bytes>) -> Response<T> {
+        let body = body.into();
+        let is_json = body.starts_with(b"{") && body.ends_with(b"}");
+
+        let mut request = self.request_builder(Method::PATCH, path);
         *request.body_mut() = body;
         if is_json {
             request.header(header::CONTENT_TYPE, "application/json");
@@ -285,17 +299,18 @@ impl MockCookieUser {
         endpoint_scopes: Option<Vec<EndpointScope>>,
         expired_at: Option<NaiveDateTime>,
     ) -> MockTokenUser {
-        let token = self.app.db(|conn| {
-            ApiToken::insert_with_scopes(
-                conn,
-                self.user.id,
-                name,
-                crate_scopes,
-                endpoint_scopes,
-                expired_at,
-            )
-            .unwrap()
-        });
+        let mut conn = self.app().db_conn();
+
+        let token = ApiToken::insert_with_scopes(
+            &mut conn,
+            self.user.id,
+            name,
+            crate_scopes,
+            endpoint_scopes,
+            expired_at,
+        )
+        .unwrap();
+
         MockTokenUser {
             app: self.app.clone(),
             token,
@@ -332,7 +347,10 @@ impl MockTokenUser {
     }
 
     /// Add to the specified crate the specified owners.
-    pub async fn add_named_owners(&self, krate_name: &str, owners: &[&str]) -> Response<OkBool> {
+    pub async fn add_named_owners<T>(&self, krate_name: &str, owners: &[T]) -> Response<OkBool>
+    where
+        T: serde::Serialize,
+    {
         let url = format!("/api/v1/crates/{krate_name}/owners");
         let body = json!({ "owners": owners }).to_string();
         self.put(&url, body).await

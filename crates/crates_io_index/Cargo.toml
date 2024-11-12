@@ -16,16 +16,17 @@ path = "lib.rs"
 testing = []
 
 [dependencies]
-anyhow = "=1.0.86"
+anyhow = "=1.0.93"
 base64 = "=0.22.1"
 crates_io_env_vars = { path = "../crates_io_env_vars" }
 git2 = "=0.19.0"
-secrecy = "=0.8.0"
-serde = { version = "=1.0.204", features = ["derive"] }
-serde_json = "=1.0.122"
-tempfile = "=3.12.0"
+secrecy = "=0.10.3"
+serde = { version = "=1.0.215", features = ["derive"] }
+serde_json = "=1.0.132"
+tempfile = "=3.14.0"
 tracing = "=0.1.40"
-url = "=2.5.2"
+url = "=2.5.3"
 
 [dev-dependencies]
 claims = "=0.7.1"
+insta = "=1.41.1"

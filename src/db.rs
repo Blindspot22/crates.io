@@ -1,5 +1,5 @@
 use crate::certs::CRUNCHY;
-use diesel::{Connection, ConnectionResult, PgConnection, QueryResult};
+use diesel::{ConnectionResult, QueryResult};
 use diesel_async::pooled_connection::deadpool::{Hook, HookError};
 use diesel_async::pooled_connection::ManagerConfig;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -11,16 +11,16 @@ use url::Url;
 
 use crate::config;
 
-pub fn oneoff_connection_with_config(
+pub async fn oneoff_connection_with_config(
     config: &config::DatabasePools,
-) -> ConnectionResult<PgConnection> {
+) -> ConnectionResult<AsyncPgConnection> {
     let url = connection_url(config, config.primary.url.expose_secret());
-    PgConnection::establish(&url)
+    establish_async_connection(&url, config.enforce_tls).await
 }
 
-pub fn oneoff_connection() -> anyhow::Result<PgConnection> {
+pub async fn oneoff_connection() -> anyhow::Result<AsyncPgConnection> {
     let config = config::DatabasePools::full_from_environment(&config::Base::from_environment()?)?;
-    oneoff_connection_with_config(&config).map_err(Into::into)
+    Ok(oneoff_connection_with_config(&config).await?)
 }
 
 pub fn connection_url(config: &config::DatabasePools, url: &str) -> String {
@@ -84,14 +84,7 @@ async fn establish_async_connection(
     let connector = MakeTlsConnector::new(connector);
     let result = tokio_postgres::connect(url, connector).await;
     let (client, conn) = result.map_err(|err| BadConnection(err.to_string()))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("Database connection: {e}");
-        }
-    });
-
-    AsyncPgConnection::try_from(client).await
+    AsyncPgConnection::try_from_client_and_connection(client, conn).await
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1,12 +1,13 @@
-use crate::builders::{CrateBuilder, VersionBuilder};
-use crate::util::{RequestHelper, TestApp};
-use crate::OkBool;
-use crates_io::schema::versions;
-use crates_io::views::EncodableVersion;
+use crate::schema::versions;
+use crate::tests::builders::{CrateBuilder, VersionBuilder};
+use crate::tests::util::{RequestHelper, TestApp};
+use crate::tests::OkBool;
+use crate::views::EncodableVersion;
 use diesel::prelude::*;
 use diesel::update;
 use googletest::prelude::*;
 use http::StatusCode;
+use insta::assert_snapshot;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn api_token_cannot_get_user_updates() {
@@ -27,25 +28,25 @@ async fn following() {
     }
 
     let (app, _, user) = TestApp::init().with_user();
+    let mut conn = app.db_conn();
     let user_model = user.as_model();
     let user_id = user_model.id;
-    app.db(|conn| {
-        CrateBuilder::new("foo_fighters", user_id)
-            .version(VersionBuilder::new("1.0.0"))
-            .expect_build(conn);
 
-        // Make foo_fighters's version mimic a version published before we started recording who
-        // published versions
-        let none: Option<i32> = None;
-        update(versions::table)
-            .set(versions::published_by.eq(none))
-            .execute(conn)
-            .unwrap();
+    CrateBuilder::new("foo_fighters", user_id)
+        .version(VersionBuilder::new("1.0.0"))
+        .expect_build(&mut conn);
 
-        CrateBuilder::new("bar_fighters", user_id)
-            .version(VersionBuilder::new("1.0.0"))
-            .expect_build(conn);
-    });
+    // Make foo_fighters's version mimic a version published before we started recording who
+    // published versions
+    let none: Option<i32> = None;
+    update(versions::table)
+        .set(versions::published_by.eq(none))
+        .execute(&mut conn)
+        .unwrap();
+
+    CrateBuilder::new("bar_fighters", user_id)
+        .version(VersionBuilder::new("1.0.0"))
+        .expect_build(&mut conn);
 
     let r: R = user.get("/api/v1/me/updates").await.good();
     assert_that!(r.versions, empty());
@@ -98,8 +99,5 @@ async fn following() {
         .get_with_query::<()>("/api/v1/me/updates", "page=0")
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "page indexing starts from 1, page 0 is invalid" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"page indexing starts from 1, page 0 is invalid"}]}"#);
 }

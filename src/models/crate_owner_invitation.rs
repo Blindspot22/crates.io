@@ -1,11 +1,12 @@
 use chrono::{NaiveDateTime, Utc};
-use diesel::prelude::*;
+use diesel_async::AsyncPgConnection;
 use http::StatusCode;
 use secrecy::SecretString;
 
 use crate::config;
 use crate::models::{CrateOwner, OwnerKind};
 use crate::schema::{crate_owner_invitations, crate_owners, crates};
+use crate::util::diesel::prelude::*;
 use crate::util::diesel::Conn;
 use crate::util::errors::{custom, AppResult};
 
@@ -36,6 +37,8 @@ impl CrateOwnerInvitation {
         conn: &mut impl Conn,
         config: &config::Server,
     ) -> QueryResult<NewCrateOwnerInvitationOutcome> {
+        use diesel::RunQueryDsl;
+
         #[derive(Insertable, Clone, Copy, Debug)]
         #[diesel(table_name = crate_owner_invitations, check_for_backend(diesel::pg::Pg))]
         struct NewRecord {
@@ -85,24 +88,42 @@ impl CrateOwnerInvitation {
         })
     }
 
-    pub fn find_by_id(user_id: i32, crate_id: i32, conn: &mut impl Conn) -> QueryResult<Self> {
+    pub async fn find_by_id(
+        user_id: i32,
+        crate_id: i32,
+        conn: &mut AsyncPgConnection,
+    ) -> QueryResult<Self> {
+        use diesel_async::RunQueryDsl;
+
         crate_owner_invitations::table
             .find((user_id, crate_id))
             .first::<Self>(conn)
+            .await
     }
 
-    pub fn find_by_token(token: &str, conn: &mut impl Conn) -> QueryResult<Self> {
+    pub async fn find_by_token(token: &str, conn: &mut AsyncPgConnection) -> QueryResult<Self> {
+        use diesel_async::RunQueryDsl;
+
         crate_owner_invitations::table
             .filter(crate_owner_invitations::token.eq(token))
             .first::<Self>(conn)
+            .await
     }
 
-    pub fn accept(self, conn: &mut impl Conn, config: &config::Server) -> AppResult<()> {
+    pub async fn accept(
+        self,
+        conn: &mut AsyncPgConnection,
+        config: &config::Server,
+    ) -> AppResult<()> {
+        use diesel_async::scoped_futures::ScopedFutureExt;
+        use diesel_async::{AsyncConnection, RunQueryDsl};
+
         if self.is_expired(config) {
             let crate_name: String = crates::table
                 .find(self.crate_id)
                 .select(crates::name)
-                .first(conn)?;
+                .first(conn)
+                .await?;
 
             let detail = format!(
                 "The invitation to become an owner of the {crate_name} crate expired. \
@@ -113,31 +134,38 @@ impl CrateOwnerInvitation {
         }
 
         conn.transaction(|conn| {
-            diesel::insert_into(crate_owners::table)
-                .values(&CrateOwner {
-                    crate_id: self.crate_id,
-                    owner_id: self.invited_user_id,
-                    created_by: self.invited_by_user_id,
-                    owner_kind: OwnerKind::User,
-                    email_notifications: true,
-                })
-                .on_conflict(crate_owners::table.primary_key())
-                .do_update()
-                .set(crate_owners::deleted.eq(false))
-                .execute(conn)?;
+            async move {
+                diesel::insert_into(crate_owners::table)
+                    .values(&CrateOwner {
+                        crate_id: self.crate_id,
+                        owner_id: self.invited_user_id,
+                        created_by: self.invited_by_user_id,
+                        owner_kind: OwnerKind::User,
+                        email_notifications: true,
+                    })
+                    .on_conflict(crate_owners::table.primary_key())
+                    .do_update()
+                    .set(crate_owners::deleted.eq(false))
+                    .execute(conn)
+                    .await?;
 
-            diesel::delete(&self).execute(conn)?;
+                diesel::delete(&self).execute(conn).await?;
 
-            Ok(())
+                Ok(())
+            }
+            .scope_boxed()
         })
+        .await
     }
 
-    pub fn decline(self, conn: &mut impl Conn) -> QueryResult<()> {
+    pub async fn decline(self, conn: &mut AsyncPgConnection) -> QueryResult<()> {
+        use diesel_async::RunQueryDsl;
+
         // The check to prevent declining expired invitations is *explicitly* missing. We do not
         // care if an expired invitation is declined, as that just removes the invitation from the
         // database.
 
-        diesel::delete(&self).execute(conn)?;
+        diesel::delete(&self).execute(conn).await?;
         Ok(())
     }
 

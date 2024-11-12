@@ -1,5 +1,7 @@
 import Model, { attr, belongsTo, hasMany } from '@ember-data/model';
+import { waitForPromise } from '@ember/test-waiters';
 
+import { apiAction } from '@mainmatter/ember-api-actions';
 import { keepLatestTask, task } from 'ember-concurrency';
 import fetch from 'fetch';
 import { alias } from 'macro-decorators';
@@ -120,6 +122,10 @@ export default class Version extends Model {
   loadReadmeTask = keepLatestTask(async () => {
     if (this.readme_path) {
       let response = await fetch(this.readme_path);
+      if (response.status === 404 || response.status === 403) {
+        return;
+      }
+
       if (!response.ok) {
         throw new Error(`README request for ${this.crateName} v${this.num} failed`);
       }
@@ -166,22 +172,14 @@ export default class Version extends Model {
   }
 
   yankTask = keepLatestTask(async () => {
-    let response = await fetch(`/api/v1/crates/${this.crate.id}/${this.num}/yank`, { method: 'DELETE' });
-    if (!response.ok) {
-      throw new Error(`Yank request for ${this.crateName} v${this.num} failed`);
-    }
-    this.set('yanked', true);
-
-    return await response.text();
+    let data = { version: { yanked: true } };
+    let payload = await waitForPromise(apiAction(this, { method: 'PATCH', data }));
+    this.store.pushPayload(payload);
   });
 
   unyankTask = keepLatestTask(async () => {
-    let response = await fetch(`/api/v1/crates/${this.crate.id}/${this.num}/unyank`, { method: 'PUT' });
-    if (!response.ok) {
-      throw new Error(`Unyank request for ${this.crateName} v${this.num} failed`);
-    }
-    this.set('yanked', false);
-
-    return await response.text();
+    let data = { version: { yanked: false } };
+    let payload = await waitForPromise(apiAction(this, { method: 'PATCH', data }));
+    this.store.pushPayload(payload);
   });
 }

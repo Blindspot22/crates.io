@@ -28,6 +28,7 @@ impl CheckTyposquat {
 
 impl BackgroundJob for CheckTyposquat {
     const JOB_NAME: &'static str = "check_typosquat";
+    const DEDUPLICATED: bool = true;
 
     type Context = Arc<Environment>;
 
@@ -86,7 +87,12 @@ struct PossibleTyposquatEmail<'a> {
 }
 
 impl Email for PossibleTyposquatEmail<'_> {
-    const SUBJECT: &'static str = "Possible typosquatting in new crate";
+    fn subject(&self) -> String {
+        format!(
+            "crates.io: Possible typosquatting in new crate \"{}\"",
+            self.crate_name
+        )
+    }
 
     fn body(&self) -> String {
         let squats = self
@@ -116,7 +122,7 @@ Specific squat checks that triggered:
 
 #[cfg(test)]
 mod tests {
-    use crate::{test_util::test_db_connection, typosquat::test_util::Faker};
+    use crate::{test_util::test_db_connection, typosquat::test_util::faker};
     use lettre::Address;
 
     use super::*;
@@ -125,25 +131,24 @@ mod tests {
     fn integration() -> anyhow::Result<()> {
         let emails = Emails::new_in_memory();
         let (_test_db, mut conn) = test_db_connection();
-        let mut faker = Faker::new();
 
         // Set up a user and a popular crate to match against.
-        let user = faker.user(&mut conn, "a")?;
-        faker.crate_and_version(&mut conn, "my-crate", "It's awesome", &user, 100)?;
+        let user = faker::user(&mut conn, "a")?;
+        faker::crate_and_version(&mut conn, "my-crate", "It's awesome", &user, 100)?;
 
         // Prime the cache so it only includes the crate we just created.
         let cache = Cache::new(vec!["admin@example.com".to_string()], &mut conn)?;
 
         // Now we'll create new crates: one problematic, one not so.
-        let other_user = faker.user(&mut conn, "b")?;
-        let (angel, _version) = faker.crate_and_version(
+        let other_user = faker::user(&mut conn, "b")?;
+        let angel = faker::crate_and_version(
             &mut conn,
             "innocent-crate",
             "I'm just a simple, innocent crate",
             &other_user,
             0,
         )?;
-        let (demon, _version) = faker.crate_and_version(
+        let demon = faker::crate_and_version(
             &mut conn,
             "mycrate",
             "I'm even more innocent, obviously",

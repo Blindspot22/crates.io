@@ -4,22 +4,28 @@
 //! index or cached metadata which was extracted (client side) from the
 //! `Cargo.toml` file.
 
-use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
-use std::cmp::Reverse;
-use std::str::FromStr;
-
-use crate::controllers::frontend_prelude::*;
+use crate::app::AppState;
 use crate::controllers::helpers::pagination::PaginationOptions;
-
 use crate::models::{
-    Category, Crate, CrateCategory, CrateKeyword, CrateVersions, Keyword, RecentCrateDownloads,
-    User, Version, VersionOwnerAction,
+    Category, Crate, CrateCategory, CrateKeyword, CrateName, Keyword, RecentCrateDownloads, User,
+    Version, VersionOwnerAction,
 };
 use crate::schema::*;
-use crate::util::errors::crate_not_found;
+use crate::tasks::spawn_blocking;
+use crate::util::diesel::prelude::*;
+use crate::util::errors::{bad_request, crate_not_found, AppResult, BoxedAppError};
+use crate::util::{redirect, RequestUtils};
 use crate::views::{
     EncodableCategory, EncodableCrate, EncodableDependency, EncodableKeyword, EncodableVersion,
 };
+use axum::extract::Path;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
+use http::request::Parts;
+use serde_json::Value;
+use std::cmp::Reverse;
+use std::str::FromStr;
 
 /// Handles the `GET /crates/new` special case.
 pub async fn show_new(app: AppState, req: Parts) -> AppResult<Json<Value>> {
@@ -30,6 +36,8 @@ pub async fn show_new(app: AppState, req: Parts) -> AppResult<Json<Value>> {
 pub async fn show(app: AppState, Path(name): Path<String>, req: Parts) -> AppResult<Json<Value>> {
     let conn = app.db_read().await?;
     spawn_blocking(move || {
+        use diesel::RunQueryDsl;
+
         let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
 
         let include = req
@@ -39,19 +47,31 @@ pub async fn show(app: AppState, Path(name): Path<String>, req: Parts) -> AppRes
             .transpose()?
             .unwrap_or_default();
 
-        let (krate, downloads): (Crate, i64) = Crate::by_name(&name)
+        let (krate, downloads, default_version, yanked): (
+            Crate,
+            i64,
+            Option<String>,
+            Option<bool>,
+        ) = Crate::by_name(&name)
             .inner_join(crate_downloads::table)
-            .select((Crate::as_select(), crate_downloads::downloads))
+            .left_join(default_versions::table)
+            .left_join(versions::table.on(default_versions::version_id.eq(versions::id)))
+            .select((
+                Crate::as_select(),
+                crate_downloads::downloads,
+                versions::num.nullable(),
+                versions::yanked.nullable(),
+            ))
             .first(conn)
             .optional()?
             .ok_or_else(|| crate_not_found(&name))?;
 
         let versions_publishers_and_audit_actions = if include.versions {
-            let mut versions_and_publishers: Vec<(Version, Option<User>)> = krate
-                .all_versions()
-                .left_outer_join(users::table)
-                .select((versions::all_columns, users::all_columns.nullable()))
-                .load(conn)?;
+            let mut versions_and_publishers: Vec<(Version, Option<User>)> =
+                Version::belonging_to(&krate)
+                    .left_outer_join(users::table)
+                    .select(<(Version, Option<User>)>::as_select())
+                    .load(conn)?;
             versions_and_publishers.sort_by_cached_key(|(version, _)| {
                 Reverse(semver::Version::parse(&version.num).ok())
             });
@@ -59,12 +79,12 @@ pub async fn show(app: AppState, Path(name): Path<String>, req: Parts) -> AppRes
             let versions = versions_and_publishers
                 .iter()
                 .map(|(v, _)| v)
-                .cloned()
                 .collect::<Vec<_>>();
+            let actions = VersionOwnerAction::for_versions(conn, &versions)?;
             Some(
                 versions_and_publishers
                     .into_iter()
-                    .zip(VersionOwnerAction::for_versions(conn, &versions)?)
+                    .zip(actions)
                     .map(|((v, pb), aas)| (v, pb, aas))
                     .collect::<Vec<_>>(),
             )
@@ -79,7 +99,7 @@ pub async fn show(app: AppState, Path(name): Path<String>, req: Parts) -> AppRes
             Some(
                 CrateKeyword::belonging_to(&krate)
                     .inner_join(keywords::table)
-                    .select(keywords::all_columns)
+                    .select(Keyword::as_select())
                     .load(conn)?,
             )
         } else {
@@ -89,7 +109,7 @@ pub async fn show(app: AppState, Path(name): Path<String>, req: Parts) -> AppRes
             Some(
                 CrateCategory::belonging_to(&krate)
                     .inner_join(categories::table)
-                    .select(categories::all_columns)
+                    .select(Category::as_select())
                     .load(conn)?,
             )
         } else {
@@ -104,8 +124,6 @@ pub async fn show(app: AppState, Path(name): Path<String>, req: Parts) -> AppRes
             None
         };
 
-        let badges = if include.badges { Some(vec![]) } else { None };
-
         let top_versions = if include.versions {
             Some(krate.top_versions(conn)?)
         } else {
@@ -114,11 +132,12 @@ pub async fn show(app: AppState, Path(name): Path<String>, req: Parts) -> AppRes
 
         let encodable_crate = EncodableCrate::from(
             krate.clone(),
+            default_version.as_deref(),
+            yanked,
             top_versions.as_ref(),
             ids,
             kws.as_deref(),
             cats.as_deref(),
-            badges,
             false,
             downloads,
             recent_downloads,
@@ -232,6 +251,8 @@ pub async fn reverse_dependencies(
 ) -> AppResult<Json<Value>> {
     let conn = app.db_read().await?;
     spawn_blocking(move || {
+        use diesel::RunQueryDsl;
+
         let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
 
         let pagination_options = PaginationOptions::builder().gather(&req)?;
@@ -249,26 +270,22 @@ pub async fn reverse_dependencies(
 
         let version_ids: Vec<i32> = rev_deps.iter().map(|dep| dep.version_id).collect();
 
-        let versions_and_publishers: Vec<(Version, String, Option<User>)> = versions::table
+        let versions_and_publishers: Vec<(Version, CrateName, Option<User>)> = versions::table
             .filter(versions::id.eq_any(version_ids))
             .inner_join(crates::table)
             .left_outer_join(users::table)
-            .select((
-                versions::all_columns,
-                crates::name,
-                users::all_columns.nullable(),
-            ))
+            .select(<(Version, CrateName, Option<User>)>::as_select())
             .load(conn)?;
         let versions = versions_and_publishers
             .iter()
-            .map(|(v, _, _)| v)
-            .cloned()
+            .map(|(v, ..)| v)
             .collect::<Vec<_>>();
+        let actions = VersionOwnerAction::for_versions(conn, &versions)?;
         let versions = versions_and_publishers
             .into_iter()
-            .zip(VersionOwnerAction::for_versions(conn, &versions)?)
+            .zip(actions)
             .map(|((version, krate_name, published_by), actions)| {
-                EncodableVersion::from(version, &krate_name, published_by, actions)
+                EncodableVersion::from(version, &krate_name.name, published_by, actions)
             })
             .collect::<Vec<_>>();
 

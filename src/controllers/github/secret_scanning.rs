@@ -1,12 +1,15 @@
 use crate::app::AppState;
-use crate::controllers::frontend_prelude::*;
 use crate::email::Email;
 use crate::models::{ApiToken, User};
 use crate::schema::api_tokens;
+use crate::tasks::spawn_blocking;
+use crate::util::diesel::prelude::*;
 use crate::util::diesel::Conn;
+use crate::util::errors::{bad_request, AppResult, BoxedAppError};
 use crate::util::token::HashedToken;
 use anyhow::{anyhow, Context};
 use axum::body::Bytes;
+use axum::Json;
 use base64::{engine::general_purpose, Engine};
 use crates_io_github::GitHubPublicKey;
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
@@ -95,11 +98,11 @@ async fn verify_github_signature(
         .find(|key| key.key_identifier == req_key_id);
 
     let Some(key) = key else {
-        return Err(bad_request(&format!("unknown key id {req_key_id}")));
+        return Err(bad_request(format!("unknown key id {req_key_id}")));
     };
 
     if !key.is_current {
-        let error = bad_request(&format!("key id {req_key_id} is not a current key"));
+        let error = bad_request(format!("key id {req_key_id} is not a current key"));
         return Err(error);
     }
 
@@ -131,6 +134,8 @@ fn alert_revoke_token(
     alert: &GitHubSecretAlert,
     conn: &mut impl Conn,
 ) -> QueryResult<GitHubSecretAlertFeedbackLabel> {
+    use diesel::RunQueryDsl;
+
     let hashed_token = HashedToken::hash(&alert.token);
 
     // Not using `ApiToken::find_by_api_token()` in order to preserve `last_used_at`
@@ -205,25 +210,31 @@ struct TokenExposedEmail<'a> {
 }
 
 impl Email for TokenExposedEmail<'_> {
-    const SUBJECT: &'static str = "Exposed API token found";
+    fn subject(&self) -> String {
+        format!(
+            "crates.io: Your API token \"{}\" has been revoked",
+            self.token_name
+        )
+    }
 
     fn body(&self) -> String {
         let mut body = format!(
-            "{reporter} has notified us that your crates.io API token {token_name}\n
-has been exposed publicly. We have revoked this token as a precaution.\n
-Please review your account at https://{domain} to confirm that no\n
-unexpected changes have been made to your settings or crates.\n
-\n
-Source type: {source}\n",
+            "{reporter} has notified us that your crates.io API token {token_name} \
+has been exposed publicly. We have revoked this token as a precaution.
+
+Please review your account at https://{domain} to confirm that no \
+unexpected changes have been made to your settings or crates.
+
+Source type: {source}",
             domain = self.domain,
             reporter = self.reporter,
             source = self.source,
             token_name = self.token_name,
         );
         if self.url.is_empty() {
-            body.push_str("\nWe were not informed of the URL where the token was found.\n");
+            body.push_str("\n\nWe were not informed of the URL where the token was found.");
         } else {
-            body.push_str(&format!("\nURL where the token was found: {}\n", self.url));
+            body.push_str(&format!("\n\nURL where the token was found: {}", self.url));
         }
 
         body

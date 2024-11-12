@@ -1,19 +1,24 @@
-use super::frontend_prelude::*;
-
 use crate::models::ApiToken;
 use crate::schema::api_tokens;
 use crate::util::rfc3339;
 use crate::views::EncodableApiTokenWithToken;
 
+use crate::app::AppState;
 use crate::auth::AuthCheck;
 use crate::models::token::{CrateScope, EndpointScope};
-use axum::extract::Query;
-use axum::response::IntoResponse;
+use crate::tasks::spawn_blocking;
+use crate::util::diesel::prelude::*;
+use crate::util::errors::{bad_request, AppResult};
+use axum::extract::{Path, Query};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use chrono::NaiveDateTime;
 use diesel::data_types::PgInterval;
 use diesel::dsl::{now, IntervalDsl};
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
-use serde_json as json;
+use http::request::Parts;
+use http::StatusCode;
+use serde_json::Value;
 
 #[derive(Deserialize)]
 pub struct GetParams {
@@ -36,60 +41,60 @@ pub async fn list(
     Query(params): Query<GetParams>,
     req: Parts,
 ) -> AppResult<Json<Value>> {
-    let conn = app.db_read_prefer_primary().await?;
-    spawn_blocking(move || {
-        let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
+    use diesel_async::RunQueryDsl;
 
-        let auth = AuthCheck::only_cookie().check(&req, conn)?;
-        let user = auth.user();
+    let mut conn = app.db_read_prefer_primary().await?;
+    let auth = AuthCheck::only_cookie().check(&req, &mut conn).await?;
+    let user = auth.user();
 
-        let tokens: Vec<ApiToken> = ApiToken::belonging_to(user)
-            .select(ApiToken::as_select())
-            .filter(api_tokens::revoked.eq(false))
-            .filter(
-                api_tokens::expired_at.is_null().or(api_tokens::expired_at
-                    .assume_not_null()
-                    .gt(now - params.expired_days_interval())),
-            )
-            .order(api_tokens::id.desc())
-            .load(conn)?;
+    let tokens: Vec<ApiToken> = ApiToken::belonging_to(user)
+        .select(ApiToken::as_select())
+        .filter(api_tokens::revoked.eq(false))
+        .filter(
+            api_tokens::expired_at.is_null().or(api_tokens::expired_at
+                .assume_not_null()
+                .gt(now - params.expired_days_interval())),
+        )
+        .order(api_tokens::id.desc())
+        .load(&mut conn)
+        .await?;
 
-        Ok(Json(json!({ "api_tokens": tokens })))
-    })
-    .await
+    Ok(Json(json!({ "api_tokens": tokens })))
+}
+
+/// The incoming serialization format for the `ApiToken` model.
+#[derive(Deserialize)]
+pub struct NewApiToken {
+    name: String,
+    crate_scopes: Option<Vec<String>>,
+    endpoint_scopes: Option<Vec<String>>,
+    #[serde(default, with = "rfc3339::option")]
+    expired_at: Option<NaiveDateTime>,
+}
+
+/// The incoming serialization format for the `ApiToken` model.
+#[derive(Deserialize)]
+pub struct NewApiTokenRequest {
+    api_token: NewApiToken,
 }
 
 /// Handles the `PUT /me/tokens` route.
-pub async fn new(app: AppState, req: BytesRequest) -> AppResult<Json<Value>> {
-    let conn = app.db_write().await?;
+pub async fn new(
+    app: AppState,
+    parts: Parts,
+    Json(new): Json<NewApiTokenRequest>,
+) -> AppResult<Json<Value>> {
+    if new.api_token.name.is_empty() {
+        return Err(bad_request("name must have a value"));
+    }
+
+    let mut conn = app.db_write().await?;
+    let auth = AuthCheck::default().check(&parts, &mut conn).await?;
     spawn_blocking(move || {
+        use diesel::RunQueryDsl;
+
         let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
 
-        /// The incoming serialization format for the `ApiToken` model.
-        #[derive(Deserialize)]
-        struct NewApiToken {
-            name: String,
-            crate_scopes: Option<Vec<String>>,
-            endpoint_scopes: Option<Vec<String>>,
-            #[serde(default, with = "rfc3339::option")]
-            expired_at: Option<NaiveDateTime>,
-        }
-
-        /// The incoming serialization format for the `ApiToken` model.
-        #[derive(Deserialize)]
-        struct NewApiTokenRequest {
-            api_token: NewApiToken,
-        }
-
-        let new: NewApiTokenRequest = json::from_slice(req.body())
-            .map_err(|e| bad_request(format!("invalid new token request: {e:?}")))?;
-
-        let name = &new.api_token.name;
-        if name.is_empty() {
-            return Err(bad_request("name must have a value"));
-        }
-
-        let auth = AuthCheck::default().check(&req, conn)?;
         if auth.api_token_id().is_some() {
             return Err(bad_request(
                 "cannot use an API token to create a new API token",
@@ -101,7 +106,7 @@ pub async fn new(app: AppState, req: BytesRequest) -> AppResult<Json<Value>> {
         let max_token_per_user = 500;
         let count: i64 = ApiToken::belonging_to(user).count().get_result(conn)?;
         if count >= max_token_per_user {
-            return Err(bad_request(&format!(
+            return Err(bad_request(format!(
                 "maximum tokens per user is: {max_token_per_user}"
             )));
         }
@@ -130,14 +135,33 @@ pub async fn new(app: AppState, req: BytesRequest) -> AppResult<Json<Value>> {
             .transpose()
             .map_err(|_err| bad_request("invalid endpoint scope"))?;
 
+        let recipient = user.email(conn)?;
+
         let api_token = ApiToken::insert_with_scopes(
             conn,
             user.id,
-            name,
+            &new.api_token.name,
             crate_scopes,
             endpoint_scopes,
             new.api_token.expired_at,
         )?;
+
+        if let Some(recipient) = recipient {
+            let email = NewTokenEmail {
+                token_name: &new.api_token.name,
+                user_name: &user.gh_login,
+                domain: &app.emails.domain,
+            };
+
+            // At this point the token has been created so failing to send the
+            // email should not cause an error response to be returned to the
+            // caller.
+            let email_ret = app.emails.send(&recipient, email);
+            if let Err(e) = email_ret {
+                error!("Failed to send token creation email: {e}")
+            }
+        }
+
         let api_token = EncodableApiTokenWithToken::from(api_token);
 
         Ok(Json(json!({ "api_token": api_token })))
@@ -147,55 +171,75 @@ pub async fn new(app: AppState, req: BytesRequest) -> AppResult<Json<Value>> {
 
 /// Handles the `GET /me/tokens/:id` route.
 pub async fn show(app: AppState, Path(id): Path<i32>, req: Parts) -> AppResult<Json<Value>> {
-    let conn = app.db_write().await?;
-    spawn_blocking(move || {
-        let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
+    use diesel_async::RunQueryDsl;
 
-        let auth = AuthCheck::default().check(&req, conn)?;
-        let user = auth.user();
-        let token = ApiToken::belonging_to(user)
-            .find(id)
-            .select(ApiToken::as_select())
-            .first(conn)?;
+    let mut conn = app.db_write().await?;
+    let auth = AuthCheck::default().check(&req, &mut conn).await?;
+    let user = auth.user();
+    let token = ApiToken::belonging_to(user)
+        .find(id)
+        .select(ApiToken::as_select())
+        .first(&mut conn)
+        .await?;
 
-        Ok(Json(json!({ "api_token": token })))
-    })
-    .await
+    Ok(Json(json!({ "api_token": token })))
 }
 
 /// Handles the `DELETE /me/tokens/:id` route.
 pub async fn revoke(app: AppState, Path(id): Path<i32>, req: Parts) -> AppResult<Json<Value>> {
-    let conn = app.db_write().await?;
-    spawn_blocking(move || {
-        let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
+    use diesel_async::RunQueryDsl;
 
-        let auth = AuthCheck::default().check(&req, conn)?;
-        let user = auth.user();
-        diesel::update(ApiToken::belonging_to(user).find(id))
-            .set(api_tokens::revoked.eq(true))
-            .execute(conn)?;
+    let mut conn = app.db_write().await?;
+    let auth = AuthCheck::default().check(&req, &mut conn).await?;
+    let user = auth.user();
+    diesel::update(ApiToken::belonging_to(user).find(id))
+        .set(api_tokens::revoked.eq(true))
+        .execute(&mut conn)
+        .await?;
 
-        Ok(Json(json!({})))
-    })
-    .await
+    Ok(Json(json!({})))
 }
 
 /// Handles the `DELETE /tokens/current` route.
 pub async fn revoke_current(app: AppState, req: Parts) -> AppResult<Response> {
-    let conn = app.db_write().await?;
-    spawn_blocking(move || {
-        let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
+    use diesel_async::RunQueryDsl;
 
-        let auth = AuthCheck::default().check(&req, conn)?;
-        let api_token_id = auth
-            .api_token_id()
-            .ok_or_else(|| bad_request("token not provided"))?;
+    let mut conn = app.db_write().await?;
+    let auth = AuthCheck::default().check(&req, &mut conn).await?;
+    let api_token_id = auth
+        .api_token_id()
+        .ok_or_else(|| bad_request("token not provided"))?;
 
-        diesel::update(api_tokens::table.filter(api_tokens::id.eq(api_token_id)))
-            .set(api_tokens::revoked.eq(true))
-            .execute(conn)?;
+    diesel::update(api_tokens::table.filter(api_tokens::id.eq(api_token_id)))
+        .set(api_tokens::revoked.eq(true))
+        .execute(&mut conn)
+        .await?;
 
-        Ok(StatusCode::NO_CONTENT.into_response())
-    })
-    .await
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+struct NewTokenEmail<'a> {
+    token_name: &'a str,
+    user_name: &'a str,
+    domain: &'a str,
+}
+
+impl<'a> crate::email::Email for NewTokenEmail<'a> {
+    fn subject(&self) -> String {
+        format!("crates.io: New API token \"{}\" created", self.token_name)
+    }
+
+    fn body(&self) -> String {
+        format!(
+            "\
+Hello {user_name}!
+
+A new API token with the name \"{token_name}\" was recently added to your {domain} account.
+
+If this wasn't you, you should revoke the token immediately: https://{domain}/settings/tokens",
+            token_name = self.token_name,
+            user_name = self.user_name,
+            domain = self.domain,
+        )
+    }
 }

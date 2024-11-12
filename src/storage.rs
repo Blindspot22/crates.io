@@ -126,6 +126,10 @@ impl Storage {
         match &config.backend {
             StorageBackend::S3 { default, index } => {
                 let options = ClientOptions::default()
+                    // Apply default content types for the version downloads archive
+                    .with_content_type_for_suffix("html", "text/html")
+                    .with_content_type_for_suffix("json", "application/json")
+                    .with_content_type_for_suffix("csv", "text/csv")
                     // The `BufWriter::new()` API currently does not allow
                     // specifying any file attributes, so we need to set the
                     // content type here instead for the database dump upload.
@@ -205,7 +209,7 @@ impl Storage {
     }
 
     /// Returns the URL of an uploaded RSS feed.
-    pub fn feed_url(&self, feed_id: &FeedId) -> String {
+    pub fn feed_url(&self, feed_id: &FeedId<'_>) -> String {
         apply_cdn_prefix(&self.cdn_prefix, &feed_id.into()).replace('+', "%2B")
     }
 
@@ -234,7 +238,7 @@ impl Storage {
     }
 
     #[instrument(skip(self))]
-    pub async fn delete_feed(&self, feed_id: &FeedId) -> Result<()> {
+    pub async fn delete_feed(&self, feed_id: &FeedId<'_>) -> Result<()> {
         let path = feed_id.into();
         self.store.delete(&path).await
     }
@@ -266,7 +270,7 @@ impl Storage {
     #[instrument(skip(self, channel))]
     pub async fn upload_feed(
         &self,
-        feed_id: &FeedId,
+        feed_id: &FeedId<'_>,
         channel: &rss::Channel,
     ) -> anyhow::Result<()> {
         let path = feed_id.into();
@@ -381,14 +385,14 @@ fn apply_cdn_prefix(cdn_prefix: &Option<String>, path: &Path) -> String {
 }
 
 #[derive(Debug)]
-pub enum FeedId {
-    Crate { name: String },
+pub enum FeedId<'a> {
+    Crate { name: &'a str },
     Crates,
     Updates,
 }
 
-impl From<&FeedId> for Path {
-    fn from(feed_id: &FeedId) -> Path {
+impl From<&FeedId<'_>> for Path {
+    fn from(feed_id: &FeedId<'_>) -> Path {
         match feed_id {
             FeedId::Crate { name } => format!("rss/crates/{name}.xml").into(),
             FeedId::Crates => "rss/crates.xml".into(),

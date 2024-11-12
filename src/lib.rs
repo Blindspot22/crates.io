@@ -19,6 +19,7 @@ extern crate serde_json;
 extern crate tracing;
 
 pub use crate::{app::App, email::Emails};
+pub use crates_io_database::schema;
 use std::sync::Arc;
 
 use crate::app::AppState;
@@ -28,12 +29,10 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
-pub mod admin;
 mod app;
 pub mod auth;
 pub mod boot;
 pub mod certs;
-pub mod ci;
 pub mod cloudfront;
 pub mod config;
 pub mod controllers;
@@ -42,6 +41,7 @@ pub mod email;
 pub mod external_urls;
 pub mod fastly;
 pub mod headers;
+pub mod index;
 mod licenses;
 pub mod metrics;
 pub mod middleware;
@@ -49,15 +49,15 @@ pub mod models;
 pub mod rate_limiter;
 mod real_ip;
 mod router;
-pub mod schema;
 pub mod sentry;
 pub mod sql;
 pub mod sqs;
 pub mod ssh;
 pub mod storage;
 pub mod tasks;
-pub mod team_repo;
 mod test_util;
+#[cfg(test)]
+pub mod tests;
 pub mod typosquat;
 pub mod util;
 pub mod views;

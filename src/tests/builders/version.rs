@@ -1,12 +1,11 @@
-use crates_io::{
+use crate::{
     models::{Crate, NewVersion, Version},
-    schema::{dependencies, versions},
+    schema::dependencies,
     util::errors::AppResult,
 };
 use std::collections::BTreeMap;
 
 use chrono::NaiveDateTime;
-use crates_io::util::errors::internal;
 use diesel::prelude::*;
 
 /// A builder to create version records for the purpose of inserting directly into the database.
@@ -97,32 +96,23 @@ impl VersionBuilder {
         published_by: i32,
         connection: &mut PgConnection,
     ) -> AppResult<Version> {
-        use diesel::{insert_into, update};
+        use diesel::insert_into;
 
-        let new_version = NewVersion::builder(crate_id, self.num.to_string())
-            .features(&self.features)?
-            .license(self.license)
+        let version = self.num.to_string();
+
+        let new_version = NewVersion::builder(crate_id, &version)
+            .features(serde_json::to_value(&self.features)?)
+            .maybe_license(self.license.as_deref())
             .size(self.size)
             .published_by(published_by)
-            .checksum(self.checksum)
-            .links(self.links)
-            .rust_version(self.rust_version)
-            .build()
-            .map_err(|error| internal(error.to_string()))?;
+            .checksum(&self.checksum)
+            .maybe_links(self.links.as_deref())
+            .maybe_rust_version(self.rust_version.as_deref())
+            .yanked(self.yanked)
+            .maybe_created_at(self.created_at.as_ref())
+            .build();
 
-        let mut vers = new_version.save(connection, "someone@example.com")?;
-
-        if self.yanked {
-            vers = update(&vers)
-                .set(versions::yanked.eq(true))
-                .get_result(connection)?;
-        }
-
-        if let Some(created_at) = self.created_at {
-            vers = update(&vers)
-                .set(versions::created_at.eq(created_at))
-                .get_result(connection)?;
-        }
+        let vers = new_version.save(connection, "someone@example.com")?;
 
         let new_deps = self
             .dependencies

@@ -2,13 +2,14 @@ use googletest::prelude::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_records_an_audit_action() {
-    use crate::builders::PublishBuilder;
-    use crate::util::{RequestHelper, TestApp};
-    use crates_io::models::VersionOwnerAction;
+    use crate::models::VersionOwnerAction;
+    use crate::tests::builders::PublishBuilder;
+    use crate::tests::util::{RequestHelper, TestApp};
 
     let (app, anon, _, token) = TestApp::full().with_token();
 
-    app.db(|conn| assert!(VersionOwnerAction::all(conn).unwrap().is_empty()));
+    let mut conn = app.db_conn();
+    assert!(VersionOwnerAction::all(&mut conn).unwrap().is_empty());
 
     // Upload a new crate, putting it in the git index
     let crate_to_publish = PublishBuilder::new("fyk", "1.0.0");

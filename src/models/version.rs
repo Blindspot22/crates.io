@@ -1,18 +1,18 @@
 use std::collections::BTreeMap;
 
+use bon::Builder;
 use chrono::NaiveDateTime;
-use derive_builder::Builder;
-use diesel::prelude::*;
+use crates_io_index::features::FeaturesMap;
+use diesel_async::AsyncPgConnection;
+use serde::Deserialize;
 
-use crate::util::errors::{bad_request, AppResult};
-
-use crate::models::{Crate, Dependency, User};
+use crate::models::{Crate, User};
 use crate::schema::*;
-use crate::sql::split_part;
+use crate::util::diesel::prelude::*;
 use crate::util::diesel::Conn;
 
 // Queryable has a custom implementation below
-#[derive(Clone, Identifiable, Associations, Debug, Queryable)]
+#[derive(Clone, Identifiable, Associations, Debug, Queryable, Selectable)]
 #[diesel(belongs_to(Crate))]
 pub struct Version {
     pub id: i32,
@@ -31,20 +31,17 @@ pub struct Version {
     pub rust_version: Option<String>,
     pub has_lib: Option<bool>,
     pub bin_names: Option<Vec<Option<String>>>,
+    pub yank_message: Option<String>,
+    pub num_no_build: String,
 }
 
 impl Version {
-    /// Returns (dependency, crate dependency name)
-    pub fn dependencies(&self, conn: &mut impl Conn) -> QueryResult<Vec<(Dependency, String)>> {
-        Dependency::belonging_to(self)
-            .inner_join(crates::table)
-            .select((dependencies::all_columns, crates::name))
-            .order((dependencies::optional, crates::name))
-            .load(conn)
-    }
-
-    pub fn record_readme_rendering(version_id: i32, conn: &mut impl Conn) -> QueryResult<usize> {
+    pub async fn record_readme_rendering(
+        version_id: i32,
+        conn: &mut AsyncPgConnection,
+    ) -> QueryResult<usize> {
         use diesel::dsl::now;
+        use diesel_async::RunQueryDsl;
 
         diesel::insert_into(readme_renderings::table)
             .values(readme_renderings::version_id.eq(version_id))
@@ -52,89 +49,61 @@ impl Version {
             .do_update()
             .set(readme_renderings::rendered_at.eq(now))
             .execute(conn)
+            .await
     }
 
     /// Gets the User who ran `cargo publish` for this version, if recorded.
     /// Not for use when you have a group of versions you need the publishers for.
-    pub fn published_by(&self, conn: &mut impl Conn) -> Option<User> {
+    pub fn published_by(&self, conn: &mut impl Conn) -> QueryResult<Option<User>> {
+        use diesel::RunQueryDsl;
+
         match self.published_by {
-            Some(pb) => users::table.find(pb).first(conn).ok(),
-            None => None,
+            Some(pb) => users::table.find(pb).first(conn).optional(),
+            None => Ok(None),
         }
+    }
+
+    /// Deserializes the `features` field from JSON into a `BTreeMap`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(BTreeMap<String, Vec<String>>)` - If the deserialization was successful.
+    /// * `Err(serde_json::Error)` - If the deserialization failed.
+    pub fn features(&self) -> Result<FeaturesMap, serde_json::Error> {
+        BTreeMap::<String, Vec<String>>::deserialize(&self.features)
     }
 }
 
 #[derive(Insertable, Debug, Builder)]
 #[diesel(table_name = versions, check_for_backend(diesel::pg::Pg))]
-pub struct NewVersion {
+pub struct NewVersion<'a> {
+    #[builder(start_fn)]
     crate_id: i32,
-    num: String,
-    #[builder(
-        default = "serde_json::Value::Object(Default::default())",
-        setter(custom)
-    )]
+    #[builder(start_fn)]
+    num: &'a str,
+    #[builder(default = strip_build_metadata(num))]
+    pub num_no_build: &'a str,
+    created_at: Option<&'a NaiveDateTime>,
+    yanked: Option<bool>,
+    #[builder(default = serde_json::Value::Object(Default::default()))]
     features: serde_json::Value,
-    #[builder(default)]
-    license: Option<String>,
-    #[builder(default, setter(name = "size"))]
+    license: Option<&'a str>,
+    #[builder(default, name = "size")]
     crate_size: i32,
     published_by: i32,
-    #[builder(setter(into))]
-    checksum: String,
-    #[builder(default)]
-    links: Option<String>,
-    #[builder(default)]
-    rust_version: Option<String>,
-    #[builder(default, setter(strip_option))]
+    checksum: &'a str,
+    links: Option<&'a str>,
+    rust_version: Option<&'a str>,
     pub has_lib: Option<bool>,
-    #[builder(default, setter(strip_option))]
-    pub bin_names: Option<Vec<String>>,
+    pub bin_names: Option<&'a [&'a str]>,
 }
 
-impl NewVersionBuilder {
-    pub fn features(
-        &mut self,
-        features: &BTreeMap<String, Vec<String>>,
-    ) -> serde_json::Result<&mut Self> {
-        self.features = Some(serde_json::to_value(features)?);
-        Ok(self)
-    }
-
-    /// Set the `checksum` field to a basic dummy value.
-    pub fn dummy_checksum(&mut self) -> &mut Self {
-        const DUMMY_CHECKSUM: &str =
-            "0000000000000000000000000000000000000000000000000000000000000000";
-
-        self.checksum = Some(DUMMY_CHECKSUM.to_string());
-        self
-    }
-}
-
-impl NewVersion {
-    pub fn builder(crate_id: i32, version: impl Into<String>) -> NewVersionBuilder {
-        let mut builder = NewVersionBuilder::default();
-        builder.crate_id(crate_id).num(version.into());
-        builder
-    }
-
-    pub fn save(&self, conn: &mut impl Conn, published_by_email: &str) -> AppResult<Version> {
-        use diesel::dsl::exists;
-        use diesel::{insert_into, select};
+impl NewVersion<'_> {
+    pub fn save(&self, conn: &mut impl Conn, published_by_email: &str) -> QueryResult<Version> {
+        use diesel::insert_into;
+        use diesel::RunQueryDsl;
 
         conn.transaction(|conn| {
-            let num_no_build = strip_build_metadata(&self.num);
-
-            let already_uploaded = versions::table
-                .filter(versions::crate_id.eq(self.crate_id))
-                .filter(split_part(versions::num, "+", 1).eq(num_no_build));
-
-            if select(exists(already_uploaded)).get_result(conn)? {
-                return Err(bad_request(format_args!(
-                    "crate version `{}` is already uploaded",
-                    num_no_build
-                )));
-            }
-
             let version: Version = insert_into(versions::table).values(self).get_result(conn)?;
 
             insert_into(versions_published_by::table)
@@ -157,6 +126,8 @@ fn strip_build_metadata(version: &str) -> &str {
 
 /// The highest version (semver order) and the most recently updated version.
 /// Typically used for a single crate.
+/// Note: `TopVersion` itself does not guarantee whether versions are yanked or not,
+/// this must be guaranteed by the input versions.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TopVersions {
     /// The "highest" version in terms of semver

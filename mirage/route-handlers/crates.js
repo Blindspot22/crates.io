@@ -227,6 +227,11 @@ export function register(server) {
   });
 
   server.put('/api/v1/crates/:name/owners', (schema, request) => {
+    let { user } = getSession(schema);
+    if (!user) {
+      return new Response(403, {}, { errors: [{ detail: 'must be logged in to perform that action' }] });
+    }
+
     let { name } = request.params;
     let crate = schema.crates.findBy({ name });
 
@@ -235,17 +240,48 @@ export function register(server) {
     }
 
     const body = JSON.parse(request.requestBody);
-    const [ownerId] = body.owners;
-    const user = schema.users.findBy({ login: ownerId });
 
-    if (!user) {
-      return { errors: [{ detail: `could not find user with login \`${ownerId}\`` }] };
+    let users = [];
+    let teams = [];
+    let msgs = [];
+    for (let login of body.owners) {
+      if (login.includes(':')) {
+        let team = schema.teams.findBy({ login });
+        if (!team) {
+          return new Response(404, {}, { errors: [{ detail: `could not find team with login \`${login}\`` }] });
+        }
+
+        teams.push(team);
+        msgs.push(`team ${login} has been added as an owner of crate ${crate.name}`);
+      } else {
+        let user = schema.users.findBy({ login });
+        if (!user) {
+          return new Response(404, {}, { errors: [{ detail: `could not find user with login \`${login}\`` }] });
+        }
+
+        users.push(user);
+        msgs.push(`user ${login} has been invited to be an owner of crate ${crate.name}`);
+      }
     }
 
-    return { ok: true };
+    for (let team of teams) {
+      schema.crateOwnerships.create({ crate, team });
+    }
+
+    for (let invitee of users) {
+      schema.crateOwnerInvitations.create({ crate, inviter: user, invitee });
+    }
+
+    let msg = msgs.join(',');
+    return { ok: true, msg };
   });
 
   server.delete('/api/v1/crates/:name/owners', (schema, request) => {
+    let { user } = getSession(schema);
+    if (!user) {
+      return new Response(403, {}, { errors: [{ detail: 'must be logged in to perform that action' }] });
+    }
+
     let { name } = request.params;
     let crate = schema.crates.findBy({ name });
 
@@ -264,7 +300,12 @@ export function register(server) {
     return { ok: true, msg: 'owners successfully removed' };
   });
 
-  server.delete('/api/v1/crates/:name/:version/yank', (schema, request) => {
+  server.patch('/api/v1/crates/:name/:version', function (schema, request) {
+    let { user } = getSession(schema);
+    if (!user) {
+      return new Response(403, {}, { errors: [{ detail: 'must be logged in to perform that action' }] });
+    }
+
     const { name, version: versionNum } = request.params;
     const crate = schema.crates.findBy({ name });
     if (!crate) {
@@ -276,10 +317,43 @@ export function register(server) {
       return notFound();
     }
 
-    return {};
+    const body = JSON.parse(request.requestBody);
+    version.update({
+      yanked: body.version.yanked,
+      yank_message: body.version.yanked ? body.version.yank_message || null : null,
+    });
+
+    return this.serialize(version);
+  });
+
+  server.delete('/api/v1/crates/:name/:version/yank', (schema, request) => {
+    let { user } = getSession(schema);
+    if (!user) {
+      return new Response(403, {}, { errors: [{ detail: 'must be logged in to perform that action' }] });
+    }
+
+    const { name, version: versionNum } = request.params;
+    const crate = schema.crates.findBy({ name });
+    if (!crate) {
+      return notFound();
+    }
+
+    const version = schema.versions.findBy({ crateId: crate.id, num: versionNum });
+    if (!version) {
+      return notFound();
+    }
+
+    version.update({ yanked: true });
+
+    return { ok: true };
   });
 
   server.put('/api/v1/crates/:name/:version/unyank', (schema, request) => {
+    let { user } = getSession(schema);
+    if (!user) {
+      return new Response(403, {}, { errors: [{ detail: 'must be logged in to perform that action' }] });
+    }
+
     const { name, version: versionNum } = request.params;
     const crate = schema.crates.findBy({ name });
     if (!crate) {
@@ -291,19 +365,21 @@ export function register(server) {
       return notFound();
     }
 
-    return {};
+    version.update({ yanked: false, yank_message: null });
+
+    return { ok: true };
   });
 
   server.get('/api/v1/crates/:name/:version/readme', (schema, request) => {
     const { name, version: versionNum } = request.params;
     const crate = schema.crates.findBy({ name });
     if (!crate) {
-      return new Response(404, { 'Content-Type': 'text/html' }, '');
+      return new Response(403, { 'Content-Type': 'text/html' }, '');
     }
 
     const version = schema.versions.findBy({ crateId: crate.id, num: versionNum });
     if (!version || !version.readme) {
-      return new Response(404, { 'Content-Type': 'text/html' }, '');
+      return new Response(403, { 'Content-Type': 'text/html' }, '');
     }
 
     return new Response(200, { 'Content-Type': 'text/html' }, version.readme);

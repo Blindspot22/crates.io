@@ -1,30 +1,37 @@
-use super::frontend_prelude::*;
-
+use crate::app::AppState;
 use crate::auth::AuthCheck;
 use crate::auth::Authentication;
 use crate::controllers::helpers::pagination::{Page, PaginationOptions};
 use crate::models::{Crate, CrateOwnerInvitation, Rights, User};
 use crate::schema::{crate_owner_invitations, crates, users};
+use crate::tasks::spawn_blocking;
+use crate::util::diesel::prelude::*;
 use crate::util::diesel::Conn;
-use crate::util::errors::{forbidden, internal};
+use crate::util::errors::{bad_request, forbidden, internal, AppResult};
+use crate::util::{BytesRequest, RequestUtils};
 use crate::views::{
     EncodableCrateOwnerInvitation, EncodableCrateOwnerInvitationV1, EncodablePublicUser,
     InvitationResponse,
 };
+use axum::extract::Path;
+use axum::Json;
 use chrono::{Duration, Utc};
-use diesel::{pg::Pg, sql_types::Bool};
+use diesel::pg::Pg;
+use diesel::sql_types::Bool;
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
+use http::request::Parts;
 use indexmap::IndexMap;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tokio::runtime::Handle;
 
 /// Handles the `GET /api/v1/me/crate_owner_invitations` route.
 pub async fn list(app: AppState, req: Parts) -> AppResult<Json<Value>> {
-    let conn = app.db_read().await?;
+    let mut conn = app.db_read().await?;
+    let auth = AuthCheck::only_cookie().check(&req, &mut conn).await?;
     spawn_blocking(move || {
         let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
 
-        let auth = AuthCheck::only_cookie().check(&req, conn)?;
         let user_id = auth.user_id();
 
         let PrivateListResponse {
@@ -62,11 +69,10 @@ pub async fn list(app: AppState, req: Parts) -> AppResult<Json<Value>> {
 
 /// Handles the `GET /api/private/crate_owner_invitations` route.
 pub async fn private_list(app: AppState, req: Parts) -> AppResult<Json<PrivateListResponse>> {
-    let conn = app.db_read().await?;
+    let mut conn = app.db_read().await?;
+    let auth = AuthCheck::only_cookie().check(&req, &mut conn).await?;
     spawn_blocking(move || {
         let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
-
-        let auth = AuthCheck::only_cookie().check(&req, conn)?;
 
         let filter = if let Some(crate_name) = req.query().get("crate_name") {
             ListFilter::CrateName(crate_name.clone())
@@ -94,6 +100,8 @@ fn prepare_list(
     filter: ListFilter,
     conn: &mut impl Conn,
 ) -> AppResult<PrivateListResponse> {
+    use diesel::RunQueryDsl;
+
     let pagination: PaginationOptions = PaginationOptions::builder()
         .enable_pages(false)
         .enable_seek(true)
@@ -268,30 +276,30 @@ struct OwnerInvitation {
 
 /// Handles the `PUT /api/v1/me/crate_owner_invitations/:crate_id` route.
 pub async fn handle_invite(state: AppState, req: BytesRequest) -> AppResult<Json<Value>> {
+    let (parts, body) = req.0.into_parts();
+
     let crate_invite: OwnerInvitation =
-        serde_json::from_slice(req.body()).map_err(|_| bad_request("invalid json request"))?;
+        serde_json::from_slice(&body).map_err(|_| bad_request("invalid json request"))?;
 
     let crate_invite = crate_invite.crate_owner_invite;
 
-    let conn = state.db_write().await?;
-    spawn_blocking(move || {
-        let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
+    let mut conn = state.db_write().await?;
+    let user_id = AuthCheck::default()
+        .check(&parts, &mut conn)
+        .await?
+        .user_id();
+    let invitation =
+        CrateOwnerInvitation::find_by_id(user_id, crate_invite.crate_id, &mut conn).await?;
 
-        let auth = AuthCheck::default().check(&req, conn)?;
-        let user_id = auth.user_id();
+    let config = &state.config;
 
-        let config = &state.config;
+    if crate_invite.accepted {
+        invitation.accept(&mut conn, config).await?;
+    } else {
+        invitation.decline(&mut conn).await?;
+    }
 
-        let invitation = CrateOwnerInvitation::find_by_id(user_id, crate_invite.crate_id, conn)?;
-        if crate_invite.accepted {
-            invitation.accept(conn, config)?;
-        } else {
-            invitation.decline(conn)?;
-        }
-
-        Ok(Json(json!({ "crate_owner_invitation": crate_invite })))
-    })
-    .await
+    Ok(Json(json!({ "crate_owner_invitation": crate_invite })))
 }
 
 /// Handles the `PUT /api/v1/me/crate_owner_invitations/accept/:token` route.
@@ -299,22 +307,18 @@ pub async fn handle_invite_with_token(
     state: AppState,
     Path(token): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let conn = state.db_write().await?;
-    spawn_blocking(move || {
-        let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
+    let mut conn = state.db_write().await?;
+    let invitation = CrateOwnerInvitation::find_by_token(&token, &mut conn).await?;
 
-        let config = &state.config;
+    let config = &state.config;
 
-        let invitation = CrateOwnerInvitation::find_by_token(&token, conn)?;
-        let crate_id = invitation.crate_id;
-        invitation.accept(conn, config)?;
+    let crate_id = invitation.crate_id;
+    invitation.accept(&mut conn, config).await?;
 
-        Ok(Json(json!({
-            "crate_owner_invitation": {
-                "crate_id": crate_id,
-                "accepted": true,
-            },
-        })))
-    })
-    .await
+    Ok(Json(json!({
+        "crate_owner_invitation": {
+            "crate_id": crate_id,
+            "accepted": true,
+        },
+    })))
 }

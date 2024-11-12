@@ -1,27 +1,27 @@
-use std::collections::BTreeMap;
-
 use chrono::NaiveDateTime;
 use diesel::associations::Identifiable;
 use diesel::dsl;
 use diesel::pg::Pg;
-use diesel::prelude::*;
 use diesel::sql_types::{Bool, Text};
-use secrecy::{ExposeSecret, SecretString};
+use diesel_async::AsyncPgConnection;
+use secrecy::SecretString;
+use thiserror::Error;
 
-use crate::app::App;
 use crate::controllers::helpers::pagination::*;
-use crate::email::Email;
+use crate::models::helpers::with_count::*;
 use crate::models::version::TopVersions;
 use crate::models::{
-    CrateOwner, CrateOwnerInvitation, Dependency, NewCrateOwnerInvitationOutcome, Owner, OwnerKind,
+    CrateOwner, CrateOwnerInvitation, NewCrateOwnerInvitationOutcome, Owner, OwnerKind,
     ReverseDependency, User, Version,
 };
-use crate::util::errors::{version_not_found, AppResult};
-
-use crate::models::helpers::with_count::*;
 use crate::schema::*;
 use crate::sql::canon_crate_name;
+use crate::util::diesel::prelude::*;
 use crate::util::diesel::Conn;
+use crate::util::errors::{version_not_found, AppResult};
+use crate::{app::App, util::errors::BoxedAppError};
+
+use super::Team;
 
 #[derive(Debug, Queryable, Identifiable, Associations, Clone, Copy)]
 #[diesel(
@@ -33,6 +33,12 @@ use crate::util::diesel::Conn;
 pub struct RecentCrateDownloads {
     pub crate_id: i32,
     pub downloads: i32,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = crates, check_for_backend(diesel::pg::Pg))]
+pub struct CrateName {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Queryable, Identifiable, AsChangeset, QueryableByName, Selectable)]
@@ -103,6 +109,7 @@ pub struct NewCrate<'a> {
 impl<'a> NewCrate<'a> {
     pub fn update(&self, conn: &mut impl Conn) -> QueryResult<Crate> {
         use diesel::update;
+        use diesel::RunQueryDsl;
 
         update(crates::table)
             .filter(canon_crate_name(crates::name).eq(canon_crate_name(self.name)))
@@ -118,6 +125,8 @@ impl<'a> NewCrate<'a> {
     }
 
     pub fn create(&self, conn: &mut impl Conn, user_id: i32) -> QueryResult<Crate> {
+        use diesel::RunQueryDsl;
+
         conn.transaction(|conn| {
             let krate: Crate = diesel::insert_into(crates::table)
                 .values(self)
@@ -187,10 +196,17 @@ impl Crate {
         crates::table.select(Self::as_select())
     }
 
-    pub fn find_version(&self, conn: &mut impl Conn, version: &str) -> AppResult<Version> {
-        self.all_versions()
+    pub async fn find_version(
+        &self,
+        conn: &mut AsyncPgConnection,
+        version: &str,
+    ) -> AppResult<Version> {
+        use diesel_async::RunQueryDsl;
+
+        Version::belonging_to(self)
             .filter(versions::num.eq(version))
             .first(conn)
+            .await
             .optional()?
             .ok_or_else(|| version_not_found(&self.name, version))
     }
@@ -326,27 +342,57 @@ impl Crate {
     }
 
     /// Return both the newest (most recently updated) and
-    /// highest version (in semver order) for the current crate.
+    /// highest version (in semver order) for the current crate,
+    /// where all top versions are not yanked.
     pub fn top_versions(&self, conn: &mut impl Conn) -> QueryResult<TopVersions> {
+        use diesel::RunQueryDsl;
+
         Ok(TopVersions::from_date_version_pairs(
-            self.versions()
+            Version::belonging_to(self)
+                .filter(versions::yanked.eq(false))
                 .select((versions::created_at, versions::num))
                 .load(conn)?,
         ))
     }
 
-    pub fn owners(&self, conn: &mut impl Conn) -> QueryResult<Vec<Owner>> {
+    pub async fn async_owners(&self, conn: &mut AsyncPgConnection) -> QueryResult<Vec<Owner>> {
+        use diesel_async::RunQueryDsl;
+
         let users = CrateOwner::by_owner_kind(OwnerKind::User)
             .filter(crate_owners::crate_id.eq(self.id))
             .inner_join(users::table)
-            .select(users::all_columns)
+            .select(User::as_select())
+            .load(conn)
+            .await?
+            .into_iter()
+            .map(Owner::User);
+
+        let teams = CrateOwner::by_owner_kind(OwnerKind::Team)
+            .filter(crate_owners::crate_id.eq(self.id))
+            .inner_join(teams::table)
+            .select(Team::as_select())
+            .load(conn)
+            .await?
+            .into_iter()
+            .map(Owner::Team);
+
+        Ok(users.chain(teams).collect())
+    }
+
+    pub fn owners(&self, conn: &mut impl Conn) -> QueryResult<Vec<Owner>> {
+        use diesel::RunQueryDsl;
+
+        let users = CrateOwner::by_owner_kind(OwnerKind::User)
+            .filter(crate_owners::crate_id.eq(self.id))
+            .inner_join(users::table)
+            .select(User::as_select())
             .load(conn)?
             .into_iter()
             .map(Owner::User);
         let teams = CrateOwner::by_owner_kind(OwnerKind::Team)
             .filter(crate_owners::crate_id.eq(self.id))
             .inner_join(teams::table)
-            .select(teams::all_columns)
+            .select(Team::as_select())
             .load(conn)?
             .into_iter()
             .map(Owner::Team);
@@ -354,54 +400,41 @@ impl Crate {
         Ok(users.chain(teams).collect())
     }
 
+    /// Invite `login` as an owner of this crate, returning the created
+    /// [`NewOwnerInvite`].
     pub fn owner_add(
         &self,
         app: &App,
         conn: &mut impl Conn,
         req_user: &User,
         login: &str,
-    ) -> AppResult<String> {
+    ) -> Result<NewOwnerInvite, OwnerAddError> {
         use diesel::insert_into;
+        use diesel::RunQueryDsl;
 
         let owner = Owner::find_or_create_by_login(app, conn, req_user, login)?;
-
         match owner {
             // Users are invited and must accept before being added
             Owner::User(user) => {
-                let config = &app.config;
-                match CrateOwnerInvitation::create(user.id, req_user.id, self.id, conn, config)? {
+                let creation_ret =
+                    CrateOwnerInvitation::create(user.id, req_user.id, self.id, conn, &app.config)
+                        .map_err(BoxedAppError::from)?;
+
+                match creation_ret {
                     NewCrateOwnerInvitationOutcome::InviteCreated { plaintext_token } => {
-                        if let Ok(Some(recipient)) = user.verified_email(conn) {
-                            // Swallow any error. Whether or not the email is sent, the invitation
-                            // entry will be created in the database and the user will see the
-                            // invitation when they visit https://crates.io/me/pending-invites/.
-                            let email = OwnerInviteEmail {
-                                user_name: &req_user.gh_login,
-                                domain: &app.emails.domain,
-                                crate_name: &self.name,
-                                token: plaintext_token,
-                            };
-
-                            let _ = app.emails.send(&recipient, email);
-                        }
-
-                        Ok(format!(
-                            "user {} has been invited to be an owner of crate {}",
-                            user.gh_login, self.name
-                        ))
+                        Ok(NewOwnerInvite::User(user, plaintext_token))
                     }
-                    NewCrateOwnerInvitationOutcome::AlreadyExists => Ok(format!(
-                        "user {} already has a pending invitation to be an owner of crate {}",
-                        user.gh_login, self.name
-                    )),
+                    NewCrateOwnerInvitationOutcome::AlreadyExists => {
+                        Err(OwnerAddError::AlreadyInvited(Box::new(user)))
+                    }
                 }
             }
             // Teams are added as owners immediately
-            owner @ Owner::Team(_) => {
+            Owner::Team(team) => {
                 insert_into(crate_owners::table)
                     .values(&CrateOwner {
                         crate_id: self.id,
-                        owner_id: owner.id(),
+                        owner_id: team.id,
                         created_by: req_user.id,
                         owner_kind: OwnerKind::Team,
                         email_notifications: true,
@@ -409,18 +442,17 @@ impl Crate {
                     .on_conflict(crate_owners::table.primary_key())
                     .do_update()
                     .set(crate_owners::deleted.eq(false))
-                    .execute(conn)?;
+                    .execute(conn)
+                    .map_err(BoxedAppError::from)?;
 
-                Ok(format!(
-                    "team {} has been added as an owner of crate {}",
-                    owner.login(),
-                    self.name
-                ))
+                Ok(NewOwnerInvite::Team(team))
             }
         }
     }
 
     pub fn owner_remove(&self, conn: &mut impl Conn, login: &str) -> AppResult<()> {
+        use diesel::RunQueryDsl;
+
         let owner = Owner::find_by_login(conn, login)?;
 
         let target = crate_owners::table.find((self.id(), owner.id(), owner.kind()));
@@ -439,6 +471,7 @@ impl Crate {
     ) -> QueryResult<(Vec<ReverseDependency>, i64)> {
         use diesel::sql_query;
         use diesel::sql_types::{BigInt, Integer};
+        use diesel::RunQueryDsl;
 
         let offset = options.offset().unwrap_or_default();
         let rows: Vec<WithCount<ReverseDependency>> =
@@ -450,135 +483,39 @@ impl Crate {
 
         Ok(rows.records_and_total())
     }
-
-    /// Gather all the necessary data to write an index metadata file
-    pub fn index_metadata(&self, conn: &mut impl Conn) -> QueryResult<Vec<crates_io_index::Crate>> {
-        let mut versions: Vec<Version> = self.all_versions().load(conn)?;
-
-        // We sort by `created_at` by default, but since tests run within a
-        // single database transaction the versions will all have the same
-        // `created_at` timestamp, so we sort by semver as a secondary key.
-        versions.sort_by_cached_key(|k| (k.created_at, semver::Version::parse(&k.num).ok()));
-
-        let deps: Vec<(Dependency, String)> = Dependency::belonging_to(&versions)
-            .inner_join(crates::table)
-            .select((dependencies::all_columns, crates::name))
-            .load(conn)?;
-
-        let deps = deps.grouped_by(&versions);
-
-        versions
-            .into_iter()
-            .zip(deps)
-            .map(|(version, deps)| {
-                let mut deps = deps
-                    .into_iter()
-                    .map(|(dep, name)| {
-                        // If this dependency has an explicit name in `Cargo.toml` that
-                        // means that the `name` we have listed is actually the package name
-                        // that we're depending on. The `name` listed in the index is the
-                        // Cargo.toml-written-name which is what cargo uses for
-                        // `--extern foo=...`
-                        let (name, package) = match dep.explicit_name {
-                            Some(explicit_name) => (explicit_name, Some(name)),
-                            None => (name, None),
-                        };
-
-                        crates_io_index::Dependency {
-                            name,
-                            req: dep.req,
-                            features: dep.features,
-                            optional: dep.optional,
-                            default_features: dep.default_features,
-                            kind: Some(dep.kind.into()),
-                            package,
-                            target: dep.target,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-
-                deps.sort();
-
-                let features: BTreeMap<String, Vec<String>> =
-                    serde_json::from_value(version.features).unwrap_or_default();
-                let (features, features2): (BTreeMap<_, _>, BTreeMap<_, _>) =
-                    features.into_iter().partition(|(_k, vals)| {
-                        !vals
-                            .iter()
-                            .any(|v| v.starts_with("dep:") || v.contains("?/"))
-                    });
-
-                let (features2, v) = if features2.is_empty() {
-                    (None, None)
-                } else {
-                    (Some(features2), Some(2))
-                };
-
-                let krate = crates_io_index::Crate {
-                    name: self.name.clone(),
-                    vers: version.num.to_string(),
-                    cksum: version.checksum,
-                    yanked: Some(version.yanked),
-                    deps,
-                    features,
-                    links: version.links,
-                    rust_version: version.rust_version,
-                    features2,
-                    v,
-                };
-
-                Ok(krate)
-            })
-            .collect()
-    }
 }
 
-struct OwnerInviteEmail<'a> {
-    user_name: &'a str,
-    domain: &'a str,
-    crate_name: &'a str,
-    token: SecretString,
+/// Details of a newly created invite.
+#[derive(Debug)]
+pub enum NewOwnerInvite {
+    /// The invitee was a [`User`], and they must accept the invite through the
+    /// UI or via the provided invite token.
+    User(User, SecretString),
+
+    /// The invitee was a [`Team`], and they were immediately added as an owner.
+    Team(Team),
 }
 
-impl Email for OwnerInviteEmail<'_> {
-    const SUBJECT: &'static str = "Crate ownership invitation";
+/// Error results from a [`Crate::owner_add()`] model call.
+#[derive(Debug, Error)]
+pub enum OwnerAddError {
+    /// An opaque [`BoxedAppError`].
+    #[error("{0}")] // AppError does not impl Error
+    AppError(BoxedAppError),
 
-    fn body(&self) -> String {
-        format!(
-            "{user_name} has invited you to become an owner of the crate {crate_name}!\n
-Visit https://{domain}/accept-invite/{token} to accept this invitation,
-or go to https://{domain}/me/pending-invites to manage all of your crate ownership invitations.",
-            user_name = self.user_name,
-            domain = self.domain,
-            crate_name = self.crate_name,
-            token = self.token.expose_secret(),
-        )
-    }
+    /// The requested invitee already has a pending invite.
+    ///
+    /// Note: Teams are always immediately added, so they cannot have a pending
+    /// invite to cause this error.
+    #[error("user already has pending invite")]
+    AlreadyInvited(Box<User>),
 }
 
-pub trait CrateVersions {
-    fn versions(&self) -> versions::BoxedQuery<'_, Pg> {
-        self.all_versions().filter(versions::yanked.eq(false))
-    }
-
-    fn all_versions(&self) -> versions::BoxedQuery<'_, Pg>;
-}
-
-impl CrateVersions for Crate {
-    fn all_versions(&self) -> versions::BoxedQuery<'_, Pg> {
-        Version::belonging_to(self).into_boxed()
-    }
-}
-
-impl CrateVersions for Vec<Crate> {
-    fn all_versions(&self) -> versions::BoxedQuery<'_, Pg> {
-        self.as_slice().all_versions()
-    }
-}
-
-impl CrateVersions for [Crate] {
-    fn all_versions(&self) -> versions::BoxedQuery<'_, Pg> {
-        Version::belonging_to(self).into_boxed()
+/// A [`BoxedAppError`] does not impl [`std::error::Error`] so it needs a manual
+/// [`From`] impl.
+impl From<BoxedAppError> for OwnerAddError {
+    fn from(value: BoxedAppError) -> Self {
+        Self::AppError(value)
     }
 }
 

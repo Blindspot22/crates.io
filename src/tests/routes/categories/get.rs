@@ -1,25 +1,31 @@
-use crate::builders::CrateBuilder;
-use crate::new_category;
-use crate::util::{MockAnonymousUser, RequestHelper, TestApp};
-use crates_io::models::Category;
+use crate::models::Category;
+use crate::tests::builders::CrateBuilder;
+use crate::tests::new_category;
+use crate::tests::util::{MockAnonymousUser, RequestHelper, TestApp};
+use crates_io_database::schema::categories;
+use diesel::{insert_into, RunQueryDsl};
 use insta::assert_json_snapshot;
 use serde_json::Value;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn show() {
     let (app, anon) = TestApp::init().empty();
+    let mut conn = app.db_conn();
+
     let url = "/api/v1/categories/foo-bar";
 
     // Return not found if a category doesn't exist
     anon.get(url).await.assert_not_found();
 
     // Create a category and a subcategory
-    app.db(|conn| {
-        assert_ok!(new_category("Foo Bar", "foo-bar", "Foo Bar crates").create_or_update(conn));
-        assert_ok!(
-            new_category("Foo Bar::Baz", "foo-bar::baz", "Baz crates").create_or_update(conn)
-        );
-    });
+    let cats = vec![
+        new_category("Foo Bar", "foo-bar", "Foo Bar crates"),
+        new_category("Foo Bar::Baz", "foo-bar::baz", "Baz crates"),
+    ];
+
+    assert_ok!(insert_into(categories::table)
+        .values(cats)
+        .execute(&mut conn));
 
     // The category and its subcategories should be in the json
     let json: Value = anon.get(url).await.good();
@@ -38,53 +44,54 @@ async fn update_crate() {
     }
 
     let (app, anon, user) = TestApp::init().with_user();
+    let mut conn = app.db_conn();
     let user = user.as_model();
 
-    let krate = app.db(|conn| {
-        assert_ok!(new_category("cat1", "cat1", "Category 1 crates").create_or_update(conn));
-        assert_ok!(
-            new_category("Category 2", "category-2", "Category 2 crates").create_or_update(conn)
-        );
+    let cats = vec![
+        new_category("cat1", "cat1", "Category 1 crates"),
+        new_category("Category 2", "category-2", "Category 2 crates"),
+    ];
 
-        CrateBuilder::new("foo_crate", user.id).expect_build(conn)
-    });
+    assert_ok!(insert_into(categories::table)
+        .values(cats)
+        .execute(&mut conn));
+
+    let krate = CrateBuilder::new("foo_crate", user.id).expect_build(&mut conn);
 
     // Updating with no categories has no effect
-    app.db(|conn| Category::update_crate(conn, &krate, &[]).unwrap());
+    Category::update_crate(&mut conn, krate.id, &[]).unwrap();
     assert_eq!(count(&anon, "cat1").await, 0);
     assert_eq!(count(&anon, "category-2").await, 0);
 
     // Happy path adding one category
-    app.db(|conn| Category::update_crate(conn, &krate, &["cat1"]).unwrap());
+    Category::update_crate(&mut conn, krate.id, &["cat1"]).unwrap();
     assert_eq!(count(&anon, "cat1").await, 1);
     assert_eq!(count(&anon, "category-2").await, 0);
 
     // Replacing one category with another
-    app.db(|conn| Category::update_crate(conn, &krate, &["category-2"]).unwrap());
+    Category::update_crate(&mut conn, krate.id, &["category-2"]).unwrap();
     assert_eq!(count(&anon, "cat1").await, 0);
     assert_eq!(count(&anon, "category-2").await, 1);
 
     // Removing one category
-    app.db(|conn| Category::update_crate(conn, &krate, &[]).unwrap());
+    Category::update_crate(&mut conn, krate.id, &[]).unwrap();
     assert_eq!(count(&anon, "cat1").await, 0);
     assert_eq!(count(&anon, "category-2").await, 0);
 
     // Adding 2 categories
-    app.db(|conn| Category::update_crate(conn, &krate, &["cat1", "category-2"]).unwrap());
+    Category::update_crate(&mut conn, krate.id, &["cat1", "category-2"]).unwrap();
     assert_eq!(count(&anon, "cat1").await, 1);
     assert_eq!(count(&anon, "category-2").await, 1);
 
     // Removing all categories
-    app.db(|conn| Category::update_crate(conn, &krate, &[]).unwrap());
+    Category::update_crate(&mut conn, krate.id, &[]).unwrap();
     assert_eq!(count(&anon, "cat1").await, 0);
     assert_eq!(count(&anon, "category-2").await, 0);
 
     // Attempting to add one valid category and one invalid category
-    app.db(|conn| {
-        let invalid_categories =
-            Category::update_crate(conn, &krate, &["cat1", "catnope"]).unwrap();
-        assert_eq!(invalid_categories, vec!["catnope"]);
-    });
+    let invalid_categories =
+        Category::update_crate(&mut conn, krate.id, &["cat1", "catnope"]).unwrap();
+    assert_eq!(invalid_categories, vec!["catnope"]);
     assert_eq!(count(&anon, "cat1").await, 1);
     assert_eq!(count(&anon, "category-2").await, 0);
 
@@ -95,15 +102,16 @@ async fn update_crate() {
     assert_eq!(json.meta.total, 2);
 
     // Attempting to add a category by display text; must use slug
-    app.db(|conn| Category::update_crate(conn, &krate, &["Category 2"]).unwrap());
+    Category::update_crate(&mut conn, krate.id, &["Category 2"]).unwrap();
     assert_eq!(count(&anon, "cat1").await, 0);
     assert_eq!(count(&anon, "category-2").await, 0);
 
     // Add a category and its subcategory
-    app.db(|conn| {
-        assert_ok!(new_category("cat1::bar", "cat1::bar", "bar crates").create_or_update(conn));
-        Category::update_crate(conn, &krate, &["cat1", "cat1::bar"]).unwrap();
-    });
+    assert_ok!(insert_into(categories::table)
+        .values(new_category("cat1::bar", "cat1::bar", "bar crates"))
+        .execute(&mut conn));
+
+    Category::update_crate(&mut conn, krate.id, &["cat1", "cat1::bar"]).unwrap();
 
     assert_eq!(count(&anon, "cat1").await, 1);
     assert_eq!(count(&anon, "cat1::bar").await, 1);

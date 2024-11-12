@@ -1,22 +1,23 @@
-use crate::{
+use crate::tests::{
     add_team_to_crate,
     builders::{CrateBuilder, PublishBuilder},
     new_team, OwnerTeamsResponse, RequestHelper, TestApp,
 };
-use crates_io::{
+use crate::{
     models::{Crate, NewTeam},
     schema::teams,
 };
 
 use diesel::*;
 use http::StatusCode;
+use insta::assert_snapshot;
 
-impl crate::util::MockAnonymousUser {
+impl crate::tests::util::MockAnonymousUser {
     /// List the team owners of the specified crate.
     async fn crate_owner_teams(
         &self,
         krate_name: &str,
-    ) -> crate::util::Response<OwnerTeamsResponse> {
+    ) -> crate::tests::util::Response<OwnerTeamsResponse> {
         let url = format!("/api/v1/crates/{krate_name}/owner_team");
         self.get(&url).await
     }
@@ -27,107 +28,87 @@ impl crate::util::MockAnonymousUser {
 async fn not_github() {
     let (app, _, user, token) = TestApp::init().with_token();
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_not_github", user.as_model().id).expect_build(conn);
-    });
+    let mut conn = app.db_conn();
+
+    CrateBuilder::new("foo_not_github", user.as_model().id).expect_build(&mut conn);
 
     let response = token
         .add_named_owner("foo_not_github", "dropbox:foo:foo")
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "unknown organization handler, only 'github:org:team' is supported" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"unknown organization handler, only 'github:org:team' is supported"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn weird_name() {
     let (app, _, user, token) = TestApp::init().with_token();
+    let mut conn = app.db_conn();
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_weird_name", user.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_weird_name", user.as_model().id).expect_build(&mut conn);
 
     let response = token
         .add_named_owner("foo_weird_name", "github:foo/../bar:wut")
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "organization cannot contain special characters like /" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"organization cannot contain special characters like /"}]}"#);
 }
 
 /// Test adding team without second `:`
 #[tokio::test(flavor = "multi_thread")]
 async fn one_colon() {
     let (app, _, user, token) = TestApp::init().with_token();
+    let mut conn = app.db_conn();
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_one_colon", user.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_one_colon", user.as_model().id).expect_build(&mut conn);
 
     let response = token.add_named_owner("foo_one_colon", "github:foo").await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "missing github team argument; format is github:org:team" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"missing github team argument; format is github:org:team"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn add_nonexistent_team() {
     let (app, _, user, token) = TestApp::init().with_token();
+    let mut conn = app.db_conn();
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_add_nonexistent", user.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_add_nonexistent", user.as_model().id).expect_build(&mut conn);
 
     let response = token
         .add_named_owner("foo_add_nonexistent", "github:test-org:this-does-not-exist")
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.json(),
-        json!({
-            "errors": [{
-                "detail":
-                "could not find the github team test-org/this-does-not-exist. \
-                Make sure that you have the right permissions in GitHub. \
-                See https://doc.rust-lang.org/cargo/reference/publishing.html#github-permissions"
-            }]
-        })
-    );
+    assert_snapshot!(response.text(), @r##"{"errors":[{"detail":"could not find the github team test-org/this-does-not-exist. Make sure that you have the right permissions in GitHub. See https://doc.rust-lang.org/cargo/reference/publishing.html#github-permissions"}]}"##);
 }
 
 /// Test adding a renamed team
 #[tokio::test(flavor = "multi_thread")]
 async fn add_renamed_team() {
     let (app, anon) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user = app.db_new_user("user-all-teams");
     let token = user.db_new_token("arbitrary token name");
     let owner_id = user.as_model().id;
 
-    app.db(|conn| {
-        use crates_io::schema::teams;
+    use crate::schema::teams;
 
-        CrateBuilder::new("foo_renamed_team", owner_id).expect_build(conn);
+    CrateBuilder::new("foo_renamed_team", owner_id).expect_build(&mut conn);
 
-        // create team with same ID and different name compared to http mock
-        // used for `async_add_named_owner`.await
-        NewTeam::new(
-            "github:test-org:old-core", // different team name
-            1000,                       // same org ID
-            2001,                       // same team id as `core` team
-            None,
-            None,
-        )
-        .create_or_update(conn)
-        .unwrap();
+    // create team with same ID and different name compared to http mock
+    // used for `async_add_named_owner`.await
+    NewTeam::new(
+        "github:test-org:old-core", // different team name
+        1000,                       // same org ID
+        2001,                       // same team id as `core` team
+        None,
+        None,
+    )
+    .create_or_update(&mut conn)
+    .unwrap();
 
-        assert_eq!(teams::table.count().get_result::<i64>(conn).unwrap(), 1);
-    });
+    assert_eq!(
+        teams::table.count().get_result::<i64>(&mut conn).unwrap(),
+        1
+    );
 
     token
         .add_named_owner("foo_renamed_team", "github:test-org:core")
@@ -143,25 +124,22 @@ async fn add_renamed_team() {
 #[tokio::test(flavor = "multi_thread")]
 async fn add_team_mixed_case() {
     let (app, anon) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user = app.db_new_user("user-all-teams");
     let token = user.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_mixed_case", user.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_mixed_case", user.as_model().id).expect_build(&mut conn);
 
     token
         .add_named_owner("foo_mixed_case", "github:Test-Org:Core")
         .await
         .good();
 
-    app.db(|conn| {
-        let krate: Crate = Crate::by_name("foo_mixed_case").first(conn).unwrap();
-        let owners = krate.owners(conn).unwrap();
-        assert_eq!(owners.len(), 2);
-        let owner = &owners[1];
-        assert_eq!(owner.login(), owner.login().to_lowercase());
-    });
+    let krate: Crate = Crate::by_name("foo_mixed_case").first(&mut conn).unwrap();
+    let owners = krate.owners(&mut conn).unwrap();
+    assert_eq!(owners.len(), 2);
+    let owner = &owners[1];
+    assert_eq!(owner.login(), owner.login().to_lowercase());
 
     let json = anon.crate_owner_teams("foo_mixed_case").await.good();
     assert_eq!(json.teams.len(), 1);
@@ -171,25 +149,22 @@ async fn add_team_mixed_case() {
 #[tokio::test(flavor = "multi_thread")]
 async fn add_team_as_org_owner() {
     let (app, anon) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user = app.db_new_user("user-org-owner");
     let token = user.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_org_owner", user.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_org_owner", user.as_model().id).expect_build(&mut conn);
 
     token
         .add_named_owner("foo_org_owner", "github:test-org:core")
         .await
         .good();
 
-    app.db(|conn| {
-        let krate: Crate = Crate::by_name("foo_org_owner").first(conn).unwrap();
-        let owners = krate.owners(conn).unwrap();
-        assert_eq!(owners.len(), 2);
-        let owner = &owners[1];
-        assert_eq!(owner.login(), owner.login().to_lowercase());
-    });
+    let krate: Crate = Crate::by_name("foo_org_owner").first(&mut conn).unwrap();
+    let owners = krate.owners(&mut conn).unwrap();
+    assert_eq!(owners.len(), 2);
+    let owner = &owners[1];
+    assert_eq!(owner.login(), owner.login().to_lowercase());
 
     let json = anon.crate_owner_teams("foo_org_owner").await.good();
     assert_eq!(json.teams.len(), 1);
@@ -200,33 +175,28 @@ async fn add_team_as_org_owner() {
 #[tokio::test(flavor = "multi_thread")]
 async fn add_team_as_non_member() {
     let (app, _) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user = app.db_new_user("user-one-team");
     let token = user.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_team_non_member", user.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_team_non_member", user.as_model().id).expect_build(&mut conn);
 
     let response = token
         .add_named_owner("foo_team_non_member", "github:test-org:core")
         .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "only members of a team or organization owners can add it as an owner" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"only members of a team or organization owners can add it as an owner"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remove_team_as_named_owner() {
     let (app, _) = TestApp::full().empty();
+    let mut conn = app.db_conn();
     let username = "user-all-teams";
     let user_on_both_teams = app.db_new_user(username);
     let token_on_both_teams = user_on_both_teams.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_remove_team", user_on_both_teams.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_remove_team", user_on_both_teams.as_model().id).expect_build(&mut conn);
 
     token_on_both_teams
         .add_named_owner("foo_remove_team", "github:test-org:core")
@@ -239,10 +209,7 @@ async fn remove_team_as_named_owner() {
         .remove_named_owner("foo_remove_team", username)
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "cannot remove all individual owners of a crate. Team member don't have permission to modify owners, so at least one individual owner is required." }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"cannot remove all individual owners of a crate. Team member don't have permission to modify owners, so at least one individual owner is required."}]}"#);
 
     token_on_both_teams
         .remove_named_owner("foo_remove_team", "github:test-org:core")
@@ -253,22 +220,18 @@ async fn remove_team_as_named_owner() {
     let crate_to_publish = PublishBuilder::new("foo_remove_team", "2.0.0");
     let response = user_on_one_team.publish_crate(crate_to_publish).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "this crate exists but you don't seem to be an owner. If you believe this is a mistake, perhaps you need to accept an invitation to be an owner before publishing." }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"this crate exists but you don't seem to be an owner. If you believe this is a mistake, perhaps you need to accept an invitation to be an owner before publishing."}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remove_team_as_team_owner() {
     let (app, _) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user_on_both_teams = app.db_new_user("user-all-teams");
     let token_on_both_teams = user_on_both_teams.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_remove_team_owner", user_on_both_teams.as_model().id)
-            .expect_build(conn);
-    });
+    CrateBuilder::new("foo_remove_team_owner", user_on_both_teams.as_model().id)
+        .expect_build(&mut conn);
 
     token_on_both_teams
         .add_named_owner("foo_remove_team_owner", "github:test-org:all")
@@ -282,10 +245,7 @@ async fn remove_team_as_team_owner() {
         .remove_named_owner("foo_remove_team_owner", "github:test-org:all")
         .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "team members don't have permission to modify owners" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"team members don't have permission to modify owners"}]}"#);
 
     let user_org_owner = app.db_new_user("user-org-owner");
     let token_org_owner = user_org_owner.db_new_token("arbitrary token name");
@@ -293,26 +253,22 @@ async fn remove_team_as_team_owner() {
         .remove_named_owner("foo_remove_team_owner", "github:test-org:all")
         .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "only owners have permission to modify owners" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"only owners have permission to modify owners"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remove_nonexistent_team() {
     let (app, _, user, token) = TestApp::init().with_token();
+    let mut conn = app.db_conn();
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_remove_nonexistent", user.as_model().id).expect_build(conn);
-        insert_into(teams::table)
-            .values((
-                teams::login.eq("github:test-org:this-does-not-exist"),
-                teams::github_id.eq(5678),
-            ))
-            .execute(conn)
-            .expect("couldn't insert nonexistent team")
-    });
+    CrateBuilder::new("foo_remove_nonexistent", user.as_model().id).expect_build(&mut conn);
+    insert_into(teams::table)
+        .values((
+            teams::login.eq("github:test-org:this-does-not-exist"),
+            teams::github_id.eq(5678),
+        ))
+        .execute(&mut conn)
+        .expect("couldn't insert nonexistent team");
 
     token
         .remove_named_owner(
@@ -327,12 +283,11 @@ async fn remove_nonexistent_team() {
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_not_owned() {
     let (app, _) = TestApp::full().empty();
+    let mut conn = app.db_conn();
     let user_on_both_teams = app.db_new_user("user-all-teams");
     let token_on_both_teams = user_on_both_teams.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_not_owned", user_on_both_teams.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_not_owned", user_on_both_teams.as_model().id).expect_build(&mut conn);
 
     token_on_both_teams
         .add_named_owner("foo_not_owned", "github:test-org:core")
@@ -344,21 +299,17 @@ async fn publish_not_owned() {
     let crate_to_publish = PublishBuilder::new("foo_not_owned", "2.0.0");
     let response = user_on_one_team.publish_crate(crate_to_publish).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "this crate exists but you don't seem to be an owner. If you believe this is a mistake, perhaps you need to accept an invitation to be an owner before publishing." }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"this crate exists but you don't seem to be an owner. If you believe this is a mistake, perhaps you need to accept an invitation to be an owner before publishing."}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_org_owner_owned() {
     let (app, _) = TestApp::full().empty();
+    let mut conn = app.db_conn();
     let user_on_both_teams = app.db_new_user("user-all-teams");
     let token_on_both_teams = user_on_both_teams.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_not_owned", user_on_both_teams.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_not_owned", user_on_both_teams.as_model().id).expect_build(&mut conn);
 
     token_on_both_teams
         .add_named_owner("foo_not_owned", "github:test-org:core")
@@ -370,22 +321,18 @@ async fn publish_org_owner_owned() {
     let crate_to_publish = PublishBuilder::new("foo_not_owned", "2.0.0");
     let response = user_org_owner.publish_crate(crate_to_publish).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "this crate exists but you don't seem to be an owner. If you believe this is a mistake, perhaps you need to accept an invitation to be an owner before publishing." }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"this crate exists but you don't seem to be an owner. If you believe this is a mistake, perhaps you need to accept an invitation to be an owner before publishing."}]}"#);
 }
 
 /// Test trying to publish a krate we do own (but only because of teams)
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_owned() {
     let (app, _) = TestApp::full().empty();
+    let mut conn = app.db_conn();
     let user_on_both_teams = app.db_new_user("user-all-teams");
     let token_on_both_teams = user_on_both_teams.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_team_owned", user_on_both_teams.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_team_owned", user_on_both_teams.as_model().id).expect_build(&mut conn);
 
     token_on_both_teams
         .add_named_owner("foo_team_owned", "github:test-org:all")
@@ -399,18 +346,19 @@ async fn publish_owned() {
         .publish_crate(crate_to_publish)
         .await
         .good();
+
+    assert_snapshot!(app.emails_snapshot());
 }
 
 /// Test trying to change owners (when only on an owning team)
 #[tokio::test(flavor = "multi_thread")]
 async fn add_owners_as_org_owner() {
     let (app, _) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user_on_both_teams = app.db_new_user("user-all-teams");
     let token_on_both_teams = user_on_both_teams.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_add_owner", user_on_both_teams.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_add_owner", user_on_both_teams.as_model().id).expect_build(&mut conn);
 
     token_on_both_teams
         .add_named_owner("foo_add_owner", "github:test-org:all")
@@ -424,21 +372,17 @@ async fn add_owners_as_org_owner() {
         .add_named_owner("foo_add_owner", "arbitrary_username")
         .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "only owners have permission to modify owners" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"only owners have permission to modify owners"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn add_owners_as_team_owner() {
     let (app, _) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user_on_both_teams = app.db_new_user("user-all-teams");
     let token_on_both_teams = user_on_both_teams.db_new_token("arbitrary token name");
 
-    app.db(|conn| {
-        CrateBuilder::new("foo_add_owner", user_on_both_teams.as_model().id).expect_build(conn);
-    });
+    CrateBuilder::new("foo_add_owner", user_on_both_teams.as_model().id).expect_build(&mut conn);
 
     token_on_both_teams
         .add_named_owner("foo_add_owner", "github:test-org:all")
@@ -452,47 +396,40 @@ async fn add_owners_as_team_owner() {
         .add_named_owner("foo_add_owner", "arbitrary_username")
         .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json(),
-        json!({ "errors": [{ "detail": "team members don't have permission to modify owners" }] })
-    );
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"team members don't have permission to modify owners"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crates_by_team_id() {
     let (app, anon, user) = TestApp::init().with_user();
+    let mut conn = app.db_conn();
     let user = user.as_model();
 
-    let team = app.db(|conn| {
-        let t = new_team("github:test-org:team")
-            .create_or_update(conn)
-            .unwrap();
-        let krate = CrateBuilder::new("foo", user.id).expect_build(conn);
-        add_team_to_crate(&t, &krate, user, conn).unwrap();
-        t
-    });
+    let t = new_team("github:test-org:team")
+        .create_or_update(&mut conn)
+        .unwrap();
+    let krate = CrateBuilder::new("foo", user.id).expect_build(&mut conn);
+    add_team_to_crate(&t, &krate, user, &mut conn).unwrap();
 
-    let json = anon.search(&format!("team_id={}", team.id)).await;
+    let json = anon.search(&format!("team_id={}", t.id)).await;
     assert_eq!(json.crates.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crates_by_team_id_not_including_deleted_owners() {
     let (app, anon) = TestApp::init().empty();
+    let mut conn = app.db_conn();
     let user = app.db_new_user("user-all-teams");
     let user = user.as_model();
 
-    let team = app.db(|conn| {
-        let t = NewTeam::new("github:test-org:core", 1000, 2001, None, None)
-            .create_or_update(conn)
-            .unwrap();
+    let t = NewTeam::new("github:test-org:core", 1000, 2001, None, None)
+        .create_or_update(&mut conn)
+        .unwrap();
 
-        let krate = CrateBuilder::new("foo", user.id).expect_build(conn);
-        add_team_to_crate(&t, &krate, user, conn).unwrap();
-        krate.owner_remove(conn, &t.login).unwrap();
-        t
-    });
+    let krate = CrateBuilder::new("foo", user.id).expect_build(&mut conn);
+    add_team_to_crate(&t, &krate, user, &mut conn).unwrap();
+    krate.owner_remove(&mut conn, &t.login).unwrap();
 
-    let json = anon.search(&format!("team_id={}", team.id)).await;
+    let json = anon.search(&format!("team_id={}", t.id)).await;
     assert_eq!(json.crates.len(), 0);
 }

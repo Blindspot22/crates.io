@@ -19,6 +19,9 @@ rust_2018_compatibility = "warn"
 rust_2021_compatibility = "warn"
 unused = "warn"
 
+[workspace.lints.rustdoc]
+unescaped_backticks = "warn"
+
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
@@ -33,107 +36,100 @@ opt-level = 2
 name = "crates_io"
 doctest = true
 
-[[test]]
-name = "all"
-path = "src/tests/all.rs"
-
-[features]
-default = ["slow-tests"]
-
-# The `slow-tests` enables tests that take a long time to finish. It is enabled
-# by default but the test suite can be run via `cargo test --no-default-features`
-# to disable these tests.
-slow-tests = []
-
 [dependencies]
-anyhow = "=1.0.86"
-async-trait = "=0.1.81"
-aws-credential-types = { version = "=1.2.0", features = ["hardcoded-credentials"] }
-aws-ip-ranges = "=0.770.0"
-aws-sdk-cloudfront = "=1.38.0"
-aws-sdk-sqs = "=1.36.0"
-axum = { version = "=0.7.5", features = ["macros", "matched-path"] }
-axum-extra = { version = "=0.9.3", features = ["cookie-signed", "typed-header"] }
+anyhow = "=1.0.93"
+async-trait = "=0.1.83"
+aws-credential-types = { version = "=1.2.1", features = ["hardcoded-credentials"] }
+aws-ip-ranges = "=0.901.0"
+aws-sdk-cloudfront = "=1.52.0"
+aws-sdk-sqs = "=1.49.0"
+axum = { version = "=0.7.7", features = ["macros", "matched-path"] }
+axum-extra = { version = "=0.9.4", features = ["cookie-signed", "typed-header"] }
 base64 = "=0.22.1"
-bigdecimal = { version = "=0.4.5", features = ["serde"] }
-cargo-manifest = "=0.15.0"
+bigdecimal = { version = "=0.4.6", features = ["serde"] }
+bon = "=2.3.0"
+cargo-manifest = "=0.16.0"
+colored = "=2.1.0"
 crates_io_cdn_logs = { path = "crates/crates_io_cdn_logs" }
+crates_io_database = { path = "crates/crates_io_database" }
+crates_io_database_dump = { path = "crates/crates_io_database_dump" }
 crates_io_env_vars = { path = "crates/crates_io_env_vars" }
 crates_io_github = { path = "crates/crates_io_github" }
 crates_io_index = { path = "crates/crates_io_index" }
 crates_io_markdown = { path = "crates/crates_io_markdown" }
+crates_io_pagerduty = { path = "crates/crates_io_pagerduty" }
 crates_io_tarball = { path = "crates/crates_io_tarball" }
+crates_io_team_repo = { path = "crates/crates_io_team_repo" }
 crates_io_worker = { path = "crates/crates_io_worker" }
-csv = "=1.3.0"
+csv = "=1.3.1"
 chrono = { version = "=0.4.38", default-features = false, features = ["serde"] }
-clap = { version = "=4.5.13", features = ["derive", "env", "unicode", "wrap_help"] }
+clap = { version = "=4.5.20", features = ["derive", "env", "unicode", "wrap_help"] }
 cookie = { version = "=0.18.1", features = ["secure"] }
 deadpool-diesel = { version = "=0.6.1", features = ["postgres", "tracing"] }
-derive_builder = "=0.20.0"
 derive_deref = "=1.1.1"
 dialoguer = "=0.11.0"
-diesel = { version = "=2.2.2", features = ["postgres", "serde_json", "chrono", "numeric"] }
-diesel-async = { version = "=0.5.0", features = ["async-connection-wrapper", "deadpool", "postgres"] }
+diesel = { version = "=2.2.4", features = ["postgres", "serde_json", "chrono", "numeric"] }
+diesel-async = { version = "=0.5.1", features = ["async-connection-wrapper", "deadpool", "postgres"] }
 diesel_full_text_search = "=2.2.0"
 diesel_migrations = { version = "=2.2.0", features = ["postgres"] }
 dotenvy = "=0.15.7"
-flate2 = "=1.0.31"
-futures-util = "=0.3.30"
-github-meta = "=0.11.0"
+flate2 = "=1.0.34"
+futures-util = "=0.3.31"
 hex = "=0.4.3"
 http = "=1.1.0"
 http-body-util = "=0.1.2"
-hyper = { version = "=1.4.1", features = ["client", "http1"] }
-indexmap = { version = "=2.3.0", features = ["serde"] }
+hyper = { version = "=1.5.0", features = ["client", "http1"] }
+indexmap = { version = "=2.6.0", features = ["serde"] }
 indicatif = "=0.17.8"
 ipnetwork = "=0.20.0"
+json-subscriber = "=0.2.2"
 tikv-jemallocator = { version = "=0.6.0", features = ['unprefixed_malloc_on_supported_platforms', 'profiling'] }
-lettre = { version = "=0.11.7", default-features = false, features = ["file-transport", "smtp-transport", "native-tls", "hostname", "builder"] }
-minijinja = "=2.1.1"
+lettre = { version = "=0.11.10", default-features = false, features = ["file-transport", "smtp-transport", "native-tls", "hostname", "builder"] }
+minijinja = "=2.5.0"
 mockall = "=0.13.0"
 native-tls = "=0.2.12"
 oauth2 = "=4.4.2"
-object_store = { version = "=0.10.2", features = ["aws"] }
+object_store = { version = "=0.11.1", features = ["aws"] }
 p256 = "=0.13.2"
 parking_lot = "=0.12.3"
 paste = "=1.0.15"
 postgres-native-tls = "=0.5.0"
 prometheus = { version = "=0.13.4", default-features = false }
-quick-xml = "=0.36.1"
+quick-xml = "=0.37.0"
 rand = "=0.8.5"
-reqwest = { version = "=0.12.5", features = ["blocking", "gzip", "json"] }
-rss = { version = "=2.0.8", default-features = false, features = ["atom"] }
-scheduled-thread-pool = "=0.2.7"
-secrecy = "=0.8.0"
+reqwest = { version = "=0.12.9", features = ["gzip", "json"] }
+rss = { version = "=2.0.9", default-features = false, features = ["atom"] }
+secrecy = "=0.10.3"
 semver = { version = "=1.0.23", features = ["serde"] }
 sentry = { version = "=0.34.0", features = ["tracing", "tower", "tower-axum-matched-path", "tower-http"] }
-serde = { version = "=1.0.204", features = ["derive"] }
-serde_json = "=1.0.122"
+serde = { version = "=1.0.215", features = ["derive"] }
+serde_json = "=1.0.132"
 sha2 = "=0.10.8"
 spdx = "=0.10.6"
-tar = "=0.4.41"
-tempfile = "=3.12.0"
-thiserror = "=1.0.63"
-tokio = { version = "=1.39.2", features = ["net", "signal", "io-std", "io-util", "rt-multi-thread", "macros", "process"]}
-tokio-postgres = "=0.7.11"
+tar = "=0.4.43"
+tempfile = "=3.14.0"
+thiserror = "=2.0.3"
+tokio = { version = "=1.41.1", features = ["net", "signal", "io-std", "io-util", "rt-multi-thread", "macros", "process"]}
+tokio-postgres = "=0.7.12"
 toml = "=0.8.19"
-tower = "=0.4.13"
-tower-http = { version = "=0.5.2", features = ["add-extension", "fs", "catch-panic", "timeout", "compression-full"] }
+tower = "=0.5.1"
+tower-http = { version = "=0.6.1", features = ["add-extension", "fs", "catch-panic", "timeout", "compression-full"] }
 tracing = "=0.1.40"
 tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "json"] }
 typomania = { version = "=0.1.2", default-features = false }
-url = "=2.5.2"
-unicode-xid = "=0.2.4"
-zip = { version = "=2.1.6", default-features = false, features = ["deflate"] }
+url = "=2.5.3"
+unicode-xid = "=0.2.6"
 
 [dev-dependencies]
-bytes = "=1.7.1"
+bytes = "=1.8.0"
 crates_io_index = { path = "crates/crates_io_index", features = ["testing"] }
 crates_io_tarball = { path = "crates/crates_io_tarball", features = ["builder"] }
+crates_io_team_repo = { path = "crates/crates_io_team_repo", features = ["mock"] }
 crates_io_test_db = { path = "crates/crates_io_test_db" }
 claims = "=0.7.1"
-diesel = { version = "=2.2.2", features = ["r2d2"] }
-googletest = "=0.11.0"
-insta = { version = "=1.39.0", features = ["glob", "json", "redactions"] }
-regex = "=1.10.6"
-tokio = "=1.39.2"
+diesel = { version = "=2.2.4", features = ["r2d2"] }
+googletest = "=0.12.0"
+insta = { version = "=1.41.1", features = ["glob", "json", "redactions"] }
+regex = "=1.11.1"
+tokio = "=1.41.1"
+zip = { version = "=2.2.0", default-features = false, features = ["deflate"] }

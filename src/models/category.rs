@@ -1,11 +1,15 @@
 use chrono::NaiveDateTime;
-use diesel::{self, *};
+use diesel::{
+    delete, dsl, insert_into, sql_query, ExpressionMethods, QueryDsl, QueryResult,
+    TextExpressionMethods,
+};
+use diesel_async::AsyncPgConnection;
 
 use crate::models::Crate;
 use crate::schema::*;
 use crate::util::diesel::Conn;
 
-#[derive(Clone, Identifiable, Queryable, QueryableByName, Debug)]
+#[derive(Clone, Identifiable, Queryable, QueryableByName, Debug, Selectable)]
 #[diesel(table_name = categories, check_for_backend(diesel::pg::Pg))]
 pub struct Category {
     pub id: i32,
@@ -44,9 +48,10 @@ impl Category {
 
     pub fn update_crate(
         conn: &mut impl Conn,
-        krate: &Crate,
+        crate_id: i32,
         slugs: &[&str],
     ) -> QueryResult<Vec<String>> {
+        use diesel::RunQueryDsl;
         conn.transaction(|conn| {
             let categories: Vec<Category> = categories::table
                 .filter(categories::slug.eq_any(slugs))
@@ -60,32 +65,39 @@ impl Category {
                 .iter()
                 .map(|c| CrateCategory {
                     category_id: c.id,
-                    crate_id: krate.id,
+                    crate_id,
                 })
                 .collect::<Vec<_>>();
 
-            delete(CrateCategory::belonging_to(krate)).execute(conn)?;
+            delete(crates_categories::table)
+                .filter(crates_categories::crate_id.eq(crate_id))
+                .execute(conn)?;
+
             insert_into(crates_categories::table)
                 .values(&crate_categories)
                 .execute(conn)?;
+
             Ok(invalid_categories)
         })
     }
 
-    pub fn count_toplevel(conn: &mut impl Conn) -> QueryResult<i64> {
+    pub async fn count_toplevel(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
+        use diesel_async::RunQueryDsl;
         categories::table
             .filter(categories::category.not_like("%::%"))
             .count()
             .get_result(conn)
+            .await
     }
 
-    pub fn toplevel(
-        conn: &mut impl Conn,
+    pub async fn toplevel(
+        conn: &mut AsyncPgConnection,
         sort: &str,
         limit: i64,
         offset: i64,
     ) -> QueryResult<Vec<Category>> {
         use diesel::sql_types::Int8;
+        use diesel_async::RunQueryDsl;
 
         let sort_sql = match sort {
             "crates" => "ORDER BY crates_cnt DESC",
@@ -98,26 +110,34 @@ impl Category {
             .bind::<Int8, _>(limit)
             .bind::<Int8, _>(offset)
             .load(conn)
+            .await
     }
 
-    pub fn subcategories(&self, conn: &mut impl Conn) -> QueryResult<Vec<Category>> {
+    pub async fn subcategories(&self, conn: &mut AsyncPgConnection) -> QueryResult<Vec<Category>> {
         use diesel::sql_types::Text;
+        use diesel_async::RunQueryDsl;
 
         sql_query(include_str!("../subcategories.sql"))
             .bind::<Text, _>(&self.category)
             .load(conn)
+            .await
     }
 
     /// Gathers the parent categories from the top-level Category to the direct parent of this Category.
     /// Returns categories as a Vector in order of traversal, not including this Category.
     /// The intention is to be able to have slugs or parent categories arrayed in order, to
     /// offer the frontend, for examples, slugs to create links to each parent category in turn.
-    pub fn parent_categories(&self, conn: &mut impl Conn) -> QueryResult<Vec<Category>> {
+    pub async fn parent_categories(
+        &self,
+        conn: &mut AsyncPgConnection,
+    ) -> QueryResult<Vec<Category>> {
         use diesel::sql_types::Text;
+        use diesel_async::RunQueryDsl;
 
         sql_query(include_str!("../parent_categories.sql"))
             .bind::<Text, _>(&self.slug)
             .load(conn)
+            .await
     }
 }
 
@@ -131,27 +151,20 @@ pub struct NewCategory<'a> {
     pub description: &'a str,
 }
 
-impl<'a> NewCategory<'a> {
-    /// Inserts the category into the database, or updates an existing one.
-    pub fn create_or_update(&self, conn: &mut impl Conn) -> QueryResult<Category> {
-        insert_into(categories::table)
-            .values(self)
-            .on_conflict(categories::slug)
-            .do_update()
-            .set(self)
-            .get_result(conn)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::test_db_connection;
+    use crates_io_test_db::TestDatabase;
+    use diesel_async::AsyncConnection;
+    use diesel_async::RunQueryDsl;
 
-    #[test]
-    fn category_toplevel_excludes_subcategories() {
+    #[tokio::test]
+    async fn category_toplevel_excludes_subcategories() {
         use self::categories;
-        let (_test_db, conn) = &mut test_db_connection();
+
+        let test_db = TestDatabase::new();
+        let mut conn = AsyncPgConnection::establish(test_db.url()).await.unwrap();
+
         insert_into(categories::table)
             .values(&vec![
                 (
@@ -167,10 +180,12 @@ mod tests {
                     categories::slug.eq("cat1::sub"),
                 ),
             ])
-            .execute(conn)
+            .execute(&mut conn)
+            .await
             .unwrap();
 
-        let cats = Category::toplevel(conn, "", 10, 0)
+        let cats = Category::toplevel(&mut conn, "", 10, 0)
+            .await
             .unwrap()
             .into_iter()
             .map(|c| c.category)
@@ -179,8 +194,8 @@ mod tests {
         assert_eq!(expected, cats);
     }
 
-    #[test]
-    fn category_toplevel_orders_by_crates_cnt_when_sort_given() {
+    #[tokio::test]
+    async fn category_toplevel_orders_by_crates_cnt_when_sort_given() {
         use self::categories;
 
         let new_cat = |category, slug, crates_cnt| {
@@ -191,17 +206,21 @@ mod tests {
             )
         };
 
-        let (_test_db, conn) = &mut test_db_connection();
+        let test_db = TestDatabase::new();
+        let mut conn = AsyncPgConnection::establish(test_db.url()).await.unwrap();
+
         insert_into(categories::table)
             .values(&vec![
                 new_cat("Cat 1", "cat1", 0),
                 new_cat("Cat 2", "cat2", 2),
                 new_cat("Cat 3", "cat3", 1),
             ])
-            .execute(conn)
+            .execute(&mut conn)
+            .await
             .unwrap();
 
-        let cats = Category::toplevel(conn, "crates", 10, 0)
+        let cats = Category::toplevel(&mut conn, "crates", 10, 0)
+            .await
             .unwrap()
             .into_iter()
             .map(|c| c.category)
@@ -214,10 +233,13 @@ mod tests {
         assert_eq!(expected, cats);
     }
 
-    #[test]
-    fn category_toplevel_applies_limit_and_offset() {
+    #[tokio::test]
+    async fn category_toplevel_applies_limit_and_offset() {
         use self::categories;
-        let (_test_db, conn) = &mut test_db_connection();
+
+        let test_db = TestDatabase::new();
+        let mut conn = AsyncPgConnection::establish(test_db.url()).await.unwrap();
+
         insert_into(categories::table)
             .values(&vec![
                 (
@@ -229,10 +251,12 @@ mod tests {
                     categories::slug.eq("cat2"),
                 ),
             ])
-            .execute(conn)
+            .execute(&mut conn)
+            .await
             .unwrap();
 
-        let cats = Category::toplevel(conn, "", 1, 0)
+        let cats = Category::toplevel(&mut conn, "", 1, 0)
+            .await
             .unwrap()
             .into_iter()
             .map(|c| c.category)
@@ -240,7 +264,8 @@ mod tests {
         let expected = vec!["Cat 1".to_string()];
         assert_eq!(expected, cats);
 
-        let cats = Category::toplevel(conn, "", 1, 1)
+        let cats = Category::toplevel(&mut conn, "", 1, 1)
+            .await
             .unwrap()
             .into_iter()
             .map(|c| c.category)
@@ -249,8 +274,8 @@ mod tests {
         assert_eq!(expected, cats);
     }
 
-    #[test]
-    fn category_toplevel_includes_subcategories_in_crate_cnt() {
+    #[tokio::test]
+    async fn category_toplevel_includes_subcategories_in_crate_cnt() {
         use self::categories;
 
         let new_cat = |category, slug, crates_cnt| {
@@ -261,7 +286,9 @@ mod tests {
             )
         };
 
-        let (_test_db, conn) = &mut test_db_connection();
+        let test_db = TestDatabase::new();
+        let mut conn = AsyncPgConnection::establish(test_db.url()).await.unwrap();
+
         insert_into(categories::table)
             .values(&vec![
                 new_cat("Cat 1", "cat1", 1),
@@ -271,10 +298,12 @@ mod tests {
                 new_cat("Cat 2::Sub 2", "cat2::sub2", 5),
                 new_cat("Cat 3", "cat3", 6),
             ])
-            .execute(conn)
+            .execute(&mut conn)
+            .await
             .unwrap();
 
-        let cats = Category::toplevel(conn, "crates", 10, 0)
+        let cats = Category::toplevel(&mut conn, "crates", 10, 0)
+            .await
             .unwrap()
             .into_iter()
             .map(|c| (c.category, c.crates_cnt))
@@ -287,8 +316,8 @@ mod tests {
         assert_eq!(expected, cats);
     }
 
-    #[test]
-    fn category_toplevel_applies_limit_and_offset_after_grouping() {
+    #[tokio::test]
+    async fn category_toplevel_applies_limit_and_offset_after_grouping() {
         use self::categories;
 
         let new_cat = |category, slug, crates_cnt| {
@@ -299,7 +328,9 @@ mod tests {
             )
         };
 
-        let (_test_db, conn) = &mut test_db_connection();
+        let test_db = TestDatabase::new();
+        let mut conn = AsyncPgConnection::establish(test_db.url()).await.unwrap();
+
         insert_into(categories::table)
             .values(&vec![
                 new_cat("Cat 1", "cat1", 1),
@@ -309,10 +340,12 @@ mod tests {
                 new_cat("Cat 2::Sub 2", "cat2::sub2", 5),
                 new_cat("Cat 3", "cat3", 6),
             ])
-            .execute(conn)
+            .execute(&mut conn)
+            .await
             .unwrap();
 
-        let cats = Category::toplevel(conn, "crates", 2, 0)
+        let cats = Category::toplevel(&mut conn, "crates", 2, 0)
+            .await
             .unwrap()
             .into_iter()
             .map(|c| (c.category, c.crates_cnt))
@@ -320,7 +353,8 @@ mod tests {
         let expected = vec![("Cat 2".to_string(), 12), ("Cat 3".to_string(), 6)];
         assert_eq!(expected, cats);
 
-        let cats = Category::toplevel(conn, "crates", 2, 1)
+        let cats = Category::toplevel(&mut conn, "crates", 2, 1)
+            .await
             .unwrap()
             .into_iter()
             .map(|c| (c.category, c.crates_cnt))
@@ -329,8 +363,8 @@ mod tests {
         assert_eq!(expected, cats);
     }
 
-    #[test]
-    fn category_parent_categories_includes_path_to_node_with_count() {
+    #[tokio::test]
+    async fn category_parent_categories_includes_path_to_node_with_count() {
         use self::categories;
 
         let new_cat = |category, slug, crates_cnt| {
@@ -341,7 +375,9 @@ mod tests {
             )
         };
 
-        let (_test_db, conn) = &mut test_db_connection();
+        let test_db = TestDatabase::new();
+        let mut conn = AsyncPgConnection::establish(test_db.url()).await.unwrap();
+
         insert_into(categories::table)
             .values(&vec![
                 new_cat("Cat 1", "cat1", 1),
@@ -353,12 +389,17 @@ mod tests {
                 new_cat("Cat 2::Sub 2", "cat2::sub2", 5),
                 new_cat("Cat 3", "cat3", 200),
             ])
-            .execute(conn)
+            .execute(&mut conn)
+            .await
             .unwrap();
 
-        let cat: Category = Category::by_slug("cat1::sub1").first(conn).unwrap();
-        let subcats = cat.subcategories(conn).unwrap();
-        let parents = cat.parent_categories(conn).unwrap();
+        let cat: Category = Category::by_slug("cat1::sub1")
+            .first(&mut conn)
+            .await
+            .unwrap();
+
+        let subcats = cat.subcategories(&mut conn).await.unwrap();
+        let parents = cat.parent_categories(&mut conn).await.unwrap();
 
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].slug, "cat1");

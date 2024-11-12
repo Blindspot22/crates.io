@@ -1,17 +1,19 @@
 use crate::config::Server;
-use crate::controllers::prelude::*;
 use crate::controllers::util::RequestPartsExt;
+use crate::middleware::app::RequestApp;
 use crate::middleware::log_request::RequestLogExt;
 use crate::middleware::real_ip::RealIp;
 use crate::models::helpers::with_count::*;
 use crate::util::errors::{bad_request, AppResult};
-use crate::util::HeaderMapExt;
+use crate::util::{HeaderMapExt, RequestUtils};
 
+use crate::util::diesel::prelude::*;
 use base64::{engine::general_purpose, Engine};
 use diesel::pg::Pg;
-use diesel::query_builder::*;
+use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
 use diesel::query_dsl::LoadQuery;
 use diesel::sql_types::BigInt;
+use http::header;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -270,7 +272,7 @@ impl<T: Query> Query for PaginatedQuery<T> {
     type SqlType = (T::SqlType, BigInt);
 }
 
-impl<T, DB> RunQueryDsl<DB> for PaginatedQuery<T> {}
+impl<T, DB> diesel::RunQueryDsl<DB> for PaginatedQuery<T> {}
 
 impl<T> QueryFragment<Pg> for PaginatedQuery<T>
 where
@@ -364,7 +366,7 @@ impl<
     type SqlType = (T::SqlType, BigInt);
 }
 
-impl<T, C, DB> RunQueryDsl<DB> for PaginatedQueryWithCountSubq<T, C> {}
+impl<T, C, DB> diesel::RunQueryDsl<DB> for PaginatedQueryWithCountSubq<T, C> {}
 
 impl<T, C> QueryFragment<Pg> for PaginatedQueryWithCountSubq<T, C>
 where

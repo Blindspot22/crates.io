@@ -1,19 +1,20 @@
 use chrono::NaiveDateTime;
-use diesel::prelude::*;
+use diesel_async::AsyncPgConnection;
 use secrecy::SecretString;
 
 use crate::app::App;
-use crate::controllers::user::me::UserConfirmEmail;
+use crate::controllers::user::update::UserConfirmEmail;
 use crate::email::Emails;
 use crate::util::errors::AppResult;
 
 use crate::models::{Crate, CrateOwner, Email, NewEmail, Owner, OwnerKind, Rights};
 use crate::schema::{crate_owners, emails, users};
 use crate::sql::lower;
+use crate::util::diesel::prelude::*;
 use crate::util::diesel::Conn;
 
 /// The model representing a row in the `users` database table.
-#[derive(Clone, Debug, PartialEq, Eq, Queryable, Identifiable, AsChangeset)]
+#[derive(Clone, Debug, PartialEq, Eq, Queryable, Identifiable, AsChangeset, Selectable)]
 pub struct User {
     pub id: i32,
     pub gh_access_token: String,
@@ -24,6 +25,94 @@ pub struct User {
     pub account_lock_reason: Option<String>,
     pub account_lock_until: Option<NaiveDateTime>,
     pub is_admin: bool,
+    pub publish_notifications: bool,
+}
+
+impl User {
+    pub fn find(conn: &mut impl Conn, id: i32) -> QueryResult<User> {
+        use diesel::RunQueryDsl;
+
+        users::table.find(id).first(conn)
+    }
+
+    pub async fn async_find(conn: &mut AsyncPgConnection, id: i32) -> QueryResult<User> {
+        use diesel_async::RunQueryDsl;
+
+        users::table.find(id).first(conn).await
+    }
+
+    pub fn find_by_login(conn: &mut impl Conn, login: &str) -> QueryResult<User> {
+        use diesel::RunQueryDsl;
+
+        users::table
+            .filter(lower(users::gh_login).eq(login.to_lowercase()))
+            .filter(users::gh_id.ne(-1))
+            .order(users::gh_id.desc())
+            .first(conn)
+    }
+
+    pub fn owning(krate: &Crate, conn: &mut impl Conn) -> QueryResult<Vec<Owner>> {
+        use diesel::RunQueryDsl;
+
+        let users = CrateOwner::by_owner_kind(OwnerKind::User)
+            .inner_join(users::table)
+            .select(User::as_select())
+            .filter(crate_owners::crate_id.eq(krate.id))
+            .load(conn)?
+            .into_iter()
+            .map(Owner::User);
+
+        Ok(users.collect())
+    }
+
+    /// Given this set of owners, determines the strongest rights the
+    /// user has.
+    ///
+    /// Shortcircuits on `Full` because you can't beat it. In practice we'll always
+    /// see `[user, user, user, ..., team, team, team]`, so we could shortcircuit on
+    /// `Publish` as well, but this is a non-obvious invariant so we don't bother.
+    /// Sweet free optimization if teams are proving burdensome to check.
+    /// More than one team isn't really expected, though.
+    pub async fn rights(&self, app: &App, owners: &[Owner]) -> AppResult<Rights> {
+        let mut best = Rights::None;
+        for owner in owners {
+            match *owner {
+                Owner::User(ref other_user) => {
+                    if other_user.id == self.id {
+                        return Ok(Rights::Full);
+                    }
+                }
+                Owner::Team(ref team) => {
+                    if team.contains_user(app, self).await? {
+                        best = Rights::Publish;
+                    }
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Queries the database for the verified emails
+    /// belonging to a given user
+    pub fn verified_email(&self, conn: &mut impl Conn) -> QueryResult<Option<String>> {
+        use diesel::RunQueryDsl;
+
+        Email::belonging_to(self)
+            .select(emails::email)
+            .filter(emails::verified.eq(true))
+            .first(conn)
+            .optional()
+    }
+
+    /// Queries for the email belonging to a particular user
+    pub fn email(&self, conn: &mut impl Conn) -> QueryResult<Option<String>> {
+        use diesel::RunQueryDsl;
+
+        Email::belonging_to(self)
+            .select(emails::email)
+            .first(conn)
+            .optional()
+    }
 }
 
 /// Represents a new user record insertable to the `users` table
@@ -65,6 +154,7 @@ impl<'a> NewUser<'a> {
         use diesel::insert_into;
         use diesel::pg::upsert::excluded;
         use diesel::sql_types::Integer;
+        use diesel::RunQueryDsl;
 
         conn.transaction(|conn| {
             let user: User = insert_into(users::table)
@@ -98,9 +188,9 @@ impl<'a> NewUser<'a> {
                     .values(&new_email)
                     .on_conflict_do_nothing()
                     .returning(emails::token)
-                    .get_result(conn)
+                    .get_result::<String>(conn)
                     .optional()?
-                    .map(SecretString::new);
+                    .map(SecretString::from);
 
                 if let Some(token) = token {
                     // Swallows any error. Some users might insert an invalid email address here.
@@ -115,76 +205,5 @@ impl<'a> NewUser<'a> {
 
             Ok(user)
         })
-    }
-}
-
-impl User {
-    pub fn find(conn: &mut impl Conn, id: i32) -> QueryResult<User> {
-        users::table.find(id).first(conn)
-    }
-
-    pub fn find_by_login(conn: &mut impl Conn, login: &str) -> QueryResult<User> {
-        users::table
-            .filter(lower(users::gh_login).eq(login.to_lowercase()))
-            .filter(users::gh_id.ne(-1))
-            .order(users::gh_id.desc())
-            .first(conn)
-    }
-
-    pub fn owning(krate: &Crate, conn: &mut impl Conn) -> QueryResult<Vec<Owner>> {
-        let users = CrateOwner::by_owner_kind(OwnerKind::User)
-            .inner_join(users::table)
-            .select(users::all_columns)
-            .filter(crate_owners::crate_id.eq(krate.id))
-            .load(conn)?
-            .into_iter()
-            .map(Owner::User);
-
-        Ok(users.collect())
-    }
-
-    /// Given this set of owners, determines the strongest rights the
-    /// user has.
-    ///
-    /// Shortcircuits on `Full` because you can't beat it. In practice we'll always
-    /// see `[user, user, user, ..., team, team, team]`, so we could shortcircuit on
-    /// `Publish` as well, but this is a non-obvious invariant so we don't bother.
-    /// Sweet free optimization if teams are proving burdensome to check.
-    /// More than one team isn't really expected, though.
-    pub async fn rights(&self, app: &App, owners: &[Owner]) -> AppResult<Rights> {
-        let mut best = Rights::None;
-        for owner in owners {
-            match *owner {
-                Owner::User(ref other_user) => {
-                    if other_user.id == self.id {
-                        return Ok(Rights::Full);
-                    }
-                }
-                Owner::Team(ref team) => {
-                    if team.contains_user(app, self).await? {
-                        best = Rights::Publish;
-                    }
-                }
-            }
-        }
-        Ok(best)
-    }
-
-    /// Queries the database for the verified emails
-    /// belonging to a given user
-    pub fn verified_email(&self, conn: &mut impl Conn) -> QueryResult<Option<String>> {
-        Email::belonging_to(self)
-            .select(emails::email)
-            .filter(emails::verified.eq(true))
-            .first(conn)
-            .optional()
-    }
-
-    /// Queries for the email belonging to a particular user
-    pub fn email(&self, conn: &mut impl Conn) -> QueryResult<Option<String>> {
-        Email::belonging_to(self)
-            .select(emails::email)
-            .first(conn)
-            .optional()
     }
 }

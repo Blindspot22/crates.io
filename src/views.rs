@@ -202,12 +202,14 @@ pub struct EncodableCrate {
     pub versions: Option<Vec<i32>>,
     pub keywords: Option<Vec<String>>,
     pub categories: Option<Vec<String>>,
-    pub badges: Option<Vec<()>>,
+    pub badges: [(); 0],
     #[serde(with = "rfc3339")]
     pub created_at: NaiveDateTime,
     // NOTE: Used by shields.io, altering `downloads` requires a PR with shields.io
     pub downloads: i64,
     pub recent_downloads: Option<i64>,
+    pub default_version: Option<String>,
+    pub yanked: bool,
     // NOTE: Used by shields.io, altering `max_version` requires a PR with shields.io
     pub max_version: String,
     pub newest_version: String, // Most recently updated version, which may not be max
@@ -224,11 +226,12 @@ impl EncodableCrate {
     #[allow(clippy::too_many_arguments)]
     pub fn from(
         krate: Crate,
+        default_version: Option<&str>,
+        yanked: Option<bool>,
         top_versions: Option<&TopVersions>,
         versions: Option<Vec<i32>>,
         keywords: Option<&[Keyword]>,
         categories: Option<&[Category]>,
-        badges: Option<Vec<()>>,
         exact_match: bool,
         downloads: i64,
         recent_downloads: Option<i64>,
@@ -249,10 +252,16 @@ impl EncodableCrate {
         };
         let keyword_ids = keywords.map(|kws| kws.iter().map(|kw| kw.keyword.clone()).collect());
         let category_ids = categories.map(|cats| cats.iter().map(|cat| cat.slug.clone()).collect());
-        let badges = badges.map(|_| vec![]);
         let homepage = remove_blocked_urls(homepage);
         let documentation = remove_blocked_urls(documentation);
         let repository = remove_blocked_urls(repository);
+
+        let default_version = default_version.map(ToString::to_string);
+        if default_version.is_none() {
+            let message = format!("Crate `{name}` has no default version");
+            sentry::capture_message(&message, sentry::Level::Info);
+        }
+        let yanked = yanked.unwrap_or_default();
 
         let max_version = top_versions
             .and_then(|v| v.highest.as_ref())
@@ -288,7 +297,9 @@ impl EncodableCrate {
             versions,
             keywords: keyword_ids,
             categories: category_ids,
-            badges,
+            badges: [],
+            default_version,
+            yanked,
             max_version,
             newest_version,
             max_stable_version,
@@ -310,19 +321,21 @@ impl EncodableCrate {
 
     pub fn from_minimal(
         krate: Crate,
+        default_version: Option<&str>,
+        yanked: Option<bool>,
         top_versions: Option<&TopVersions>,
-        badges: Option<Vec<()>>,
         exact_match: bool,
         downloads: i64,
         recent_downloads: Option<i64>,
     ) -> Self {
         Self::from(
             krate,
+            default_version,
+            yanked,
             top_versions,
             None,
             None,
             None,
-            badges,
             exact_match,
             downloads,
             recent_downloads,
@@ -436,7 +449,7 @@ impl From<CreatedApiToken> for EncodableApiTokenWithToken {
     fn from(token: CreatedApiToken) -> Self {
         EncodableApiTokenWithToken {
             token: token.model,
-            plaintext: token.plaintext.expose_secret().clone(),
+            plaintext: token.plaintext.expose_secret().to_string(),
         }
     }
 }
@@ -468,6 +481,7 @@ pub struct EncodablePrivateUser {
     pub avatar: Option<String>,
     pub url: Option<String>,
     pub is_admin: bool,
+    pub publish_notifications: bool,
 }
 
 impl EncodablePrivateUser {
@@ -484,6 +498,7 @@ impl EncodablePrivateUser {
             gh_login,
             gh_avatar,
             is_admin,
+            publish_notifications,
             ..
         } = user;
         let url = format!("https://github.com/{gh_login}");
@@ -498,6 +513,7 @@ impl EncodablePrivateUser {
             name,
             url: Some(url),
             is_admin,
+            publish_notifications,
         }
     }
 }
@@ -558,6 +574,7 @@ pub struct EncodableVersion {
     pub downloads: i32,
     pub features: serde_json::Value,
     pub yanked: bool,
+    pub yank_message: Option<String>,
     pub lib_links: Option<String>,
     // NOTE: Used by shields.io, altering `license` requires a PR with shields.io
     pub license: Option<String>,
@@ -586,6 +603,7 @@ impl EncodableVersion {
             downloads,
             features,
             yanked,
+            yank_message,
             links: lib_links,
             license,
             crate_size,
@@ -613,6 +631,7 @@ impl EncodableVersion {
             downloads,
             features,
             yanked,
+            yank_message,
             lib_links,
             license,
             links,
@@ -736,6 +755,7 @@ mod tests {
             downloads: 0,
             features: serde_json::from_str("{}").unwrap(),
             yanked: false,
+            yank_message: None,
             license: None,
             lib_links: None,
             links: EncodableVersionLinks {
@@ -786,13 +806,15 @@ mod tests {
             versions: None,
             keywords: None,
             categories: None,
-            badges: None,
+            badges: [],
             created_at: NaiveDate::from_ymd_opt(2017, 1, 6)
                 .unwrap()
                 .and_hms_opt(14, 23, 12)
                 .unwrap(),
             downloads: 0,
             recent_downloads: None,
+            default_version: None,
+            yanked: false,
             max_version: "".to_string(),
             newest_version: "".to_string(),
             max_stable_version: None,

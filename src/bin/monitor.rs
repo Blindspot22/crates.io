@@ -6,17 +6,25 @@
 
 use anyhow::Result;
 use crates_io::worker::jobs;
-use crates_io::{admin::on_call, db, schema::*};
-use crates_io_env_vars::{var, var_parsed};
+use crates_io::{db, schema::*};
+use crates_io_env_vars::{required_var, var, var_parsed};
+use crates_io_pagerduty as pagerduty;
+use crates_io_pagerduty::PagerdutyClient;
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
-fn main() -> Result<()> {
-    let conn = &mut db::oneoff_connection()?;
+#[tokio::main]
+async fn main() -> Result<()> {
+    let api_token = required_var("PAGERDUTY_API_TOKEN")?.into();
+    let service_key = required_var("PAGERDUTY_INTEGRATION_KEY")?;
+    let client = PagerdutyClient::new(api_token, service_key);
 
-    check_failing_background_jobs(conn)?;
-    check_stalled_update_downloads(conn)?;
-    check_spam_attack(conn)?;
+    let conn = &mut db::oneoff_connection().await?;
+
+    check_failing_background_jobs(conn, &client).await?;
+    check_stalled_update_downloads(conn, &client).await?;
+    check_spam_attack(conn, &client).await?;
     Ok(())
 }
 
@@ -28,7 +36,10 @@ fn main() -> Result<()> {
 ///
 /// Within the default 15 minute time, a job should have already had several
 /// failed retry attempts.
-fn check_failing_background_jobs(conn: &mut PgConnection) -> Result<()> {
+async fn check_failing_background_jobs(
+    conn: &mut AsyncPgConnection,
+    pagerduty: &PagerdutyClient,
+) -> Result<()> {
     use diesel::dsl::*;
     use diesel::sql_types::Integer;
 
@@ -45,30 +56,35 @@ fn check_failing_background_jobs(conn: &mut PgConnection) -> Result<()> {
         .filter(background_jobs::priority.ge(0))
         .for_update()
         .skip_locked()
-        .load(conn)?;
+        .load(conn)
+        .await?;
 
     let stalled_job_count = stalled_jobs.len();
 
     let event = if stalled_job_count > 0 {
-        on_call::Event::Trigger {
+        pagerduty::Event::Trigger {
             incident_key: Some(EVENT_KEY.into()),
             description: format!(
                 "{stalled_job_count} jobs have been in the queue for more than {max_job_time} minutes"
             ),
         }
     } else {
-        on_call::Event::Resolve {
+        pagerduty::Event::Resolve {
             incident_key: EVENT_KEY.into(),
             description: Some("No stalled background jobs".into()),
         }
     };
 
-    log_and_trigger_event(event)?;
+    log_and_trigger_event(pagerduty, event).await?;
+
     Ok(())
 }
 
 /// Check for an `update_downloads` job that has run longer than expected
-fn check_stalled_update_downloads(conn: &mut PgConnection) -> Result<()> {
+async fn check_stalled_update_downloads(
+    conn: &mut AsyncPgConnection,
+    pagerduty: &PagerdutyClient,
+) -> Result<()> {
     use chrono::{DateTime, NaiveDateTime, Utc};
 
     const EVENT_KEY: &str = "update_downloads_stalled";
@@ -81,28 +97,40 @@ fn check_stalled_update_downloads(conn: &mut PgConnection) -> Result<()> {
     let start_time: Result<NaiveDateTime, _> = background_jobs::table
         .filter(background_jobs::job_type.eq(jobs::UpdateDownloads::JOB_NAME))
         .select(background_jobs::created_at)
-        .first(conn);
+        .first(conn)
+        .await;
 
     if let Ok(start_time) = start_time {
         let start_time = DateTime::<Utc>::from_naive_utc_and_offset(start_time, Utc);
         let minutes = Utc::now().signed_duration_since(start_time).num_minutes();
 
         if minutes > max_job_time {
-            return log_and_trigger_event(on_call::Event::Trigger {
-                incident_key: Some(EVENT_KEY.into()),
-                description: format!("update_downloads job running for {minutes} minutes"),
-            });
+            return log_and_trigger_event(
+                pagerduty,
+                pagerduty::Event::Trigger {
+                    incident_key: Some(EVENT_KEY.into()),
+                    description: format!("update_downloads job running for {minutes} minutes"),
+                },
+            )
+            .await;
         }
     };
 
-    log_and_trigger_event(on_call::Event::Resolve {
-        incident_key: EVENT_KEY.into(),
-        description: Some("No stalled update_downloads job".into()),
-    })
+    log_and_trigger_event(
+        pagerduty,
+        pagerduty::Event::Resolve {
+            incident_key: EVENT_KEY.into(),
+            description: Some("No stalled update_downloads job".into()),
+        },
+    )
+    .await
 }
 
 /// Check for known spam patterns
-fn check_spam_attack(conn: &mut PgConnection) -> Result<()> {
+async fn check_spam_attack(
+    conn: &mut AsyncPgConnection,
+    pagerduty: &PagerdutyClient,
+) -> Result<()> {
     use crates_io::sql::canon_crate_name;
 
     const EVENT_KEY: &str = "spam_attack";
@@ -121,6 +149,7 @@ fn check_spam_attack(conn: &mut PgConnection) -> Result<()> {
         .filter(canon_crate_name(crates::name).eq_any(bad_crate_names))
         .select(crates::name)
         .first(conn)
+        .await
         .optional()?;
 
     if let Some(bad_crate) = bad_crate {
@@ -128,31 +157,31 @@ fn check_spam_attack(conn: &mut PgConnection) -> Result<()> {
     }
 
     let event = if let Some(event_description) = event_description {
-        on_call::Event::Trigger {
+        pagerduty::Event::Trigger {
             incident_key: Some(EVENT_KEY.into()),
             description: format!("{event_description}, possible spam attack underway"),
         }
     } else {
-        on_call::Event::Resolve {
+        pagerduty::Event::Resolve {
             incident_key: EVENT_KEY.into(),
             description: Some("No spam crates detected".into()),
         }
     };
 
-    log_and_trigger_event(event)?;
+    log_and_trigger_event(pagerduty, event).await?;
     Ok(())
 }
 
-fn log_and_trigger_event(event: on_call::Event) -> Result<()> {
+async fn log_and_trigger_event(pagerduty: &PagerdutyClient, event: pagerduty::Event) -> Result<()> {
     match event {
-        on_call::Event::Trigger {
+        pagerduty::Event::Trigger {
             ref description, ..
         } => println!("Paging on-call: {description}"),
-        on_call::Event::Resolve {
+        pagerduty::Event::Resolve {
             description: Some(ref description),
             ..
         } => println!("{description}"),
         _ => {} // noop
     }
-    event.send()
+    pagerduty.send(&event).await
 }

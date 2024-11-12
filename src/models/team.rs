@@ -1,4 +1,4 @@
-use diesel::prelude::*;
+use diesel_async::AsyncPgConnection;
 use http::StatusCode;
 
 use crate::app::App;
@@ -11,11 +11,12 @@ use tokio::runtime::Handle;
 use crate::models::{Crate, CrateOwner, Owner, OwnerKind, User};
 use crate::schema::{crate_owners, teams};
 use crate::sql::lower;
+use crate::util::diesel::prelude::*;
 use crate::util::diesel::Conn;
 
 /// For now, just a Github Team. Can be upgraded to other teams
 /// later if desirable.
-#[derive(Queryable, Identifiable, Serialize, Deserialize, Debug)]
+#[derive(Queryable, Identifiable, Serialize, Deserialize, Debug, Selectable)]
 pub struct Team {
     /// Unique table id
     pub id: i32,
@@ -39,8 +40,8 @@ pub struct Team {
 pub struct NewTeam<'a> {
     pub login: &'a str,
     pub github_id: i32,
-    pub name: Option<String>,
-    pub avatar: Option<String>,
+    pub name: Option<&'a str>,
+    pub avatar: Option<&'a str>,
     pub org_id: i32,
 }
 
@@ -49,8 +50,8 @@ impl<'a> NewTeam<'a> {
         login: &'a str,
         org_id: i32,
         github_id: i32,
-        name: Option<String>,
-        avatar: Option<String>,
+        name: Option<&'a str>,
+        avatar: Option<&'a str>,
     ) -> Self {
         NewTeam {
             login,
@@ -63,6 +64,7 @@ impl<'a> NewTeam<'a> {
 
     pub fn create_or_update(&self, conn: &mut impl Conn) -> QueryResult<Team> {
         use diesel::insert_into;
+        use diesel::RunQueryDsl;
 
         insert_into(teams::table)
             .values(self)
@@ -75,6 +77,8 @@ impl<'a> NewTeam<'a> {
 
 impl Team {
     pub fn find_by_login(conn: &mut impl Conn, login: &str) -> QueryResult<Self> {
+        use diesel::RunQueryDsl;
+
         teams::table
             .filter(lower(teams::login).eq(&login.to_lowercase()))
             .first(conn)
@@ -174,8 +178,8 @@ impl Team {
             &login.to_lowercase(),
             org_id,
             team.id,
-            team.name,
-            org.avatar_url,
+            team.name.as_deref(),
+            org.avatar_url.as_deref(),
         )
         .create_or_update(conn)
         .map_err(Into::into)
@@ -196,13 +200,16 @@ impl Team {
         }
     }
 
-    pub fn owning(krate: &Crate, conn: &mut impl Conn) -> QueryResult<Vec<Owner>> {
+    pub async fn owning(krate: &Crate, conn: &mut AsyncPgConnection) -> QueryResult<Vec<Owner>> {
+        use diesel_async::RunQueryDsl;
+
         let base_query = CrateOwner::belonging_to(krate).filter(crate_owners::deleted.eq(false));
         let teams = base_query
             .inner_join(teams::table)
-            .select(teams::all_columns)
+            .select(Team::as_select())
             .filter(crate_owners::owner_kind.eq(OwnerKind::Team))
-            .load(conn)?
+            .load(conn)
+            .await?
             .into_iter()
             .map(Owner::Team);
 

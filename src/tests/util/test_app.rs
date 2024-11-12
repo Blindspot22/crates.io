@@ -1,24 +1,31 @@
 use super::{MockAnonymousUser, MockCookieUser, MockTokenUser};
-use crate::util::chaosproxy::ChaosProxy;
-use crate::util::github::{MockGitHubClient, MOCK_GITHUB_DATA};
-use crates_io::config::{
+use crate::config::{
     self, Base, CdnLogQueueConfig, CdnLogStorageConfig, DatabasePools, DbPoolConfig,
 };
-use crates_io::middleware::cargo_compat::StatusCodeConfig;
-use crates_io::models::token::{CrateScope, EndpointScope};
-use crates_io::rate_limiter::{LimitedAction, RateLimiterConfig};
-use crates_io::storage::StorageConfig;
-use crates_io::team_repo::MockTeamRepo;
-use crates_io::worker::{Environment, RunnerExt};
-use crates_io::{App, Emails, Env};
+use crate::middleware::cargo_compat::StatusCodeConfig;
+use crate::models::token::{CrateScope, EndpointScope};
+use crate::models::User;
+use crate::rate_limiter::{LimitedAction, RateLimiterConfig};
+use crate::schema::users;
+use crate::storage::StorageConfig;
+use crate::tests::util::chaosproxy::ChaosProxy;
+use crate::tests::util::github::{MockGitHubClient, MOCK_GITHUB_DATA};
+use crate::worker::{Environment, RunnerExt};
+use crate::{App, Emails, Env};
 use crates_io_index::testing::UpstreamIndex;
 use crates_io_index::{Credentials, RepositoryConfig};
+use crates_io_team_repo::MockTeamRepo;
 use crates_io_test_db::TestDatabase;
 use crates_io_worker::Runner;
+use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::PgConnection;
+use diesel_async::AsyncPgConnection;
 use futures_util::TryStreamExt;
 use oauth2::{ClientId, ClientSecret};
+use regex::Regex;
 use std::collections::HashSet;
+use std::ops::DerefMut;
+use std::sync::LazyLock;
 use std::{rc::Rc, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 use tokio::task::block_in_place;
@@ -38,7 +45,7 @@ struct TestAppInner {
 
 impl Drop for TestAppInner {
     fn drop(&mut self) {
-        use crates_io::schema::background_jobs;
+        use crate::schema::background_jobs;
         use diesel::prelude::*;
 
         // Avoid a double-panic if the test is already failing
@@ -88,7 +95,7 @@ pub struct TestApp(Rc<TestAppInner>);
 impl TestApp {
     /// Initialize an application with an `Uploader` that panics
     pub fn init() -> TestAppBuilder {
-        crates_io::util::tracing::init_for_test();
+        crate::util::tracing::init_for_test();
 
         TestAppBuilder {
             config: simple_config(),
@@ -104,39 +111,43 @@ impl TestApp {
         Self::init().with_git_index().with_job_runner()
     }
 
-    /// Obtain the database connection and pass it to the closure
-    ///
-    /// Within each test, the connection pool only has 1 connection so it is necessary to drop the
-    /// connection before making any API calls.  Once the closure returns, the connection is
-    /// dropped, ensuring it is returned to the pool and available for any future API calls.
-    pub fn db<T, F: FnOnce(&mut PgConnection) -> T>(&self, f: F) -> T {
-        f(&mut self.0.test_database.connect())
+    /// Obtain a database connection.
+    pub fn db_conn(&self) -> PooledConnection<ConnectionManager<PgConnection>> {
+        self.0.test_database.connect()
     }
 
-    /// Create a new user with a verified email address in the database and return a mock user
-    /// session
+    /// Obtain an async database connection from the primary database pool.
+    pub async fn async_db_conn(&self) -> impl DerefMut<Target = AsyncPgConnection> {
+        let result = self.as_inner().primary_database.get().await;
+        result.expect("Failed to get database connection")
+    }
+
+    /// Create a new user with a verified email address in the database
+    /// (`<username>@example.com`) and return a mock user session.
     ///
     /// This method updates the database directly
     pub fn db_new_user(&self, username: &str) -> MockCookieUser {
-        use crates_io::schema::emails;
+        use crate::schema::emails;
         use diesel::prelude::*;
 
-        let user = self.db(|conn| {
-            let email = "something@example.com";
+        let mut conn = self.db_conn();
 
-            let user = crate::new_user(username)
-                .create_or_update(None, &self.0.app.emails, conn)
-                .unwrap();
-            diesel::insert_into(emails::table)
-                .values((
-                    emails::user_id.eq(user.id),
-                    emails::email.eq(email),
-                    emails::verified.eq(true),
-                ))
-                .execute(conn)
-                .unwrap();
-            user
-        });
+        let email = format!("{username}@example.com");
+
+        let user: User = diesel::insert_into(users::table)
+            .values(crate::tests::new_user(username))
+            .get_result(&mut conn)
+            .unwrap();
+
+        diesel::insert_into(emails::table)
+            .values((
+                emails::user_id.eq(user.id),
+                emails::email.eq(email),
+                emails::verified.eq(true),
+            ))
+            .execute(&mut conn)
+            .unwrap();
+
         MockCookieUser {
             app: self.clone(),
             user,
@@ -164,6 +175,39 @@ impl TestApp {
         list.into_iter()
             .map(|meta| meta.location.to_string())
             .collect()
+    }
+
+    pub fn emails(&self) -> Vec<String> {
+        let emails = self.as_inner().emails.mails_in_memory().unwrap();
+        emails.into_iter().map(|(_, email)| email).collect()
+    }
+
+    pub fn emails_snapshot(&self) -> String {
+        static EMAIL_HEADER_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(Message-ID|Date): [^\r\n]+\r\n").unwrap());
+
+        static DATE_TIME_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z").unwrap());
+
+        static EMAIL_CONFIRM_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"/confirm/\w+").unwrap());
+
+        static INVITE_TOKEN_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"/accept-invite/\w+").unwrap());
+
+        static SEPARATOR: &str = "\n----------------------------------------\n\n";
+
+        self.emails()
+            .into_iter()
+            .map(|email| {
+                let email = EMAIL_HEADER_REGEX.replace_all(&email, "");
+                let email = DATE_TIME_REGEX.replace_all(&email, "[0000-00-00T00:00:00Z]");
+                let email = EMAIL_CONFIRM_REGEX.replace_all(&email, "/confirm/[confirm-token]");
+                let email = INVITE_TOKEN_REGEX.replace_all(&email, "/accept-invite/[invite-token]");
+                email.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(SEPARATOR)
     }
 
     pub async fn run_pending_background_jobs(&self) {
@@ -272,8 +316,7 @@ impl TestAppBuilder {
                 .deadpool(app.primary_database.clone())
                 .emails(app.emails.clone())
                 .team_repo(Box::new(self.team_repo))
-                .build()
-                .unwrap();
+                .build();
 
             let runner = Runner::new(app.primary_database.clone(), Arc::new(environment))
                 .shutdown_when_queue_empty()
@@ -456,6 +499,6 @@ fn build_app(config: config::Server) -> (Arc<App>, axum::Router) {
     let app = App::new(config, emails, github);
 
     let app = Arc::new(app);
-    let router = crates_io::build_handler(Arc::clone(&app));
+    let router = crate::build_handler(Arc::clone(&app));
     (app, router)
 }

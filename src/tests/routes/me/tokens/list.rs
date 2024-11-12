@@ -1,9 +1,10 @@
-use crate::util::insta::{self, assert_json_snapshot};
-use crate::util::{RequestHelper, TestApp};
+use crate::models::token::{CrateScope, EndpointScope};
+use crate::models::ApiToken;
+use crate::tests::util::insta::{self, assert_json_snapshot};
+use crate::tests::util::{RequestHelper, TestApp};
 use chrono::{Duration, Utc};
-use crates_io::models::token::{CrateScope, EndpointScope};
-use crates_io::models::ApiToken;
 use http::StatusCode;
+use insta::assert_snapshot;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_logged_out() {
@@ -22,39 +23,35 @@ async fn list_empty() {
     let (_, _, user) = TestApp::init().with_user();
     let response = user.get::<()>("/api/v1/me/tokens").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let json = response.json();
-    let response_tokens = json["api_tokens"].as_array().unwrap();
-    assert_eq!(response_tokens.len(), 0);
+    assert_snapshot!(response.text(), @r#"{"api_tokens":[]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_tokens() {
     let (app, _, user) = TestApp::init().with_user();
+    let mut conn = app.db_conn();
     let id = user.as_model().id;
-    app.db(|conn| {
-        vec![
-            assert_ok!(ApiToken::insert(conn, id, "bar")),
-            assert_ok!(ApiToken::insert_with_scopes(
-                conn,
-                id,
-                "baz",
-                Some(vec![
-                    CrateScope::try_from("serde").unwrap(),
-                    CrateScope::try_from("serde-*").unwrap()
-                ]),
-                Some(vec![EndpointScope::PublishUpdate]),
-                None
-            )),
-            assert_ok!(ApiToken::insert_with_scopes(
-                conn,
-                id,
-                "qux",
-                None,
-                None,
-                Some((Utc::now() - Duration::days(1)).naive_utc()),
-            )),
-        ]
-    });
+
+    assert_ok!(ApiToken::insert(&mut conn, id, "bar"));
+    assert_ok!(ApiToken::insert_with_scopes(
+        &mut conn,
+        id,
+        "baz",
+        Some(vec![
+            CrateScope::try_from("serde").unwrap(),
+            CrateScope::try_from("serde-*").unwrap()
+        ]),
+        Some(vec![EndpointScope::PublishUpdate]),
+        None
+    ));
+    assert_ok!(ApiToken::insert_with_scopes(
+        &mut conn,
+        id,
+        "qux",
+        None,
+        None,
+        Some((Utc::now() - Duration::days(1)).naive_utc()),
+    ));
 
     let response = user.get::<()>("/api/v1/me/tokens").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -73,31 +70,29 @@ async fn list_recently_expired_tokens() {
     }
 
     let (app, _, user) = TestApp::init().with_user();
+    let mut conn = app.db_conn();
     let id = user.as_model().id;
-    app.db(|conn| {
-        vec![
-            assert_ok!(ApiToken::insert(conn, id, "bar")),
-            assert_ok!(ApiToken::insert_with_scopes(
-                conn,
-                id,
-                "ancient",
-                Some(vec![
-                    CrateScope::try_from("serde").unwrap(),
-                    CrateScope::try_from("serde-*").unwrap()
-                ]),
-                Some(vec![EndpointScope::PublishUpdate]),
-                Some((Utc::now() - Duration::days(31)).naive_utc()),
-            )),
-            assert_ok!(ApiToken::insert_with_scopes(
-                conn,
-                id,
-                "recent",
-                None,
-                None,
-                Some((Utc::now() - Duration::days(1)).naive_utc()),
-            )),
-        ]
-    });
+
+    assert_ok!(ApiToken::insert(&mut conn, id, "bar"));
+    assert_ok!(ApiToken::insert_with_scopes(
+        &mut conn,
+        id,
+        "ancient",
+        Some(vec![
+            CrateScope::try_from("serde").unwrap(),
+            CrateScope::try_from("serde-*").unwrap()
+        ]),
+        Some(vec![EndpointScope::PublishUpdate]),
+        Some((Utc::now() - Duration::days(31)).naive_utc()),
+    ));
+    assert_ok!(ApiToken::insert_with_scopes(
+        &mut conn,
+        id,
+        "recent",
+        None,
+        None,
+        Some((Utc::now() - Duration::days(1)).naive_utc()),
+    ));
 
     let response = user.get::<()>("/api/v1/me/tokens?expired_days=30").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -120,13 +115,11 @@ async fn list_recently_expired_tokens() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_tokens_exclude_revoked() {
     let (app, _, user) = TestApp::init().with_user();
+    let mut conn = app.db_conn();
     let id = user.as_model().id;
-    let tokens = app.db(|conn| {
-        vec![
-            assert_ok!(ApiToken::insert(conn, id, "bar")),
-            assert_ok!(ApiToken::insert(conn, id, "baz")),
-        ]
-    });
+
+    let token1 = assert_ok!(ApiToken::insert(&mut conn, id, "bar"));
+    assert_ok!(ApiToken::insert(&mut conn, id, "baz"));
 
     // List tokens expecting them all to be there.
     let response = user.get::<()>("/api/v1/me/tokens").await;
@@ -137,7 +130,7 @@ async fn list_tokens_exclude_revoked() {
 
     // Revoke the first token.
     let response = user
-        .delete::<()>(&format!("/api/v1/me/tokens/{}", tokens[0].model.id))
+        .delete::<()>(&format!("/api/v1/me/tokens/{}", token1.model.id))
         .await;
     assert_eq!(response.status(), StatusCode::OK);
 

@@ -7,11 +7,11 @@ use lettre::transport::file::FileTransport;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::SmtpTransport;
 use lettre::transport::stub::StubTransport;
-use lettre::{Message, Transport};
+use lettre::{Address, Message, Transport};
 use rand::distributions::{Alphanumeric, DistString};
 
 pub trait Email {
-    const SUBJECT: &'static str;
+    fn subject(&self) -> String;
     fn body(&self) -> String;
 }
 
@@ -19,7 +19,7 @@ pub trait Email {
 pub struct Emails {
     backend: EmailBackend,
     pub domain: String,
-    from: Mailbox,
+    from: Address,
 }
 
 const DEFAULT_FROM: &str = "noreply@crates.io";
@@ -97,13 +97,15 @@ impl Emails {
             self.domain,
         );
 
-        let subject = E::SUBJECT;
+        let from = Mailbox::new(Some(self.domain.clone()), self.from.clone());
+
+        let subject = email.subject();
         let body = email.body();
 
         let email = Message::builder()
             .message_id(Some(message_id.clone()))
             .to(recipient.parse()?)
-            .from(self.from.clone())
+            .from(from)
             .subject(subject)
             .header(ContentType::TEXT_PLAIN)
             .body(body)?;
@@ -160,7 +162,9 @@ mod tests {
     struct TestEmail;
 
     impl Email for TestEmail {
-        const SUBJECT: &'static str = "test";
+        fn subject(&self) -> String {
+            "test".into()
+        }
 
         fn body(&self) -> String {
             "test".into()

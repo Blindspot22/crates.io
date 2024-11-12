@@ -1,23 +1,30 @@
 //! Endpoint for searching and discovery functionality
 
 use crate::auth::AuthCheck;
-use diesel::dsl::*;
+use crate::util::diesel::prelude::*;
+use axum::Json;
+use diesel::dsl::{exists, sql, InnerJoinQuerySource, LeftJoinQuerySource};
 use diesel::sql_types::{Array, Bool, Text};
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
+use diesel_async::AsyncPgConnection;
 use diesel_full_text_search::*;
+use http::request::Parts;
+use serde_json::Value;
 use std::cell::OnceCell;
+use tokio::runtime::Handle;
 
-use crate::controllers::cargo_prelude::*;
+use crate::app::AppState;
 use crate::controllers::helpers::Paginate;
-use crate::models::{Crate, CrateOwner, CrateVersions, OwnerKind, TopVersions, Version};
+use crate::models::{Crate, CrateOwner, OwnerKind, TopVersions, Version};
 use crate::schema::*;
-use crate::util::errors::bad_request;
+use crate::util::errors::{bad_request, AppResult};
 use crate::views::EncodableCrate;
 
 use crate::controllers::helpers::pagination::{Page, Paginated, PaginationOptions};
 use crate::models::krate::ALL_COLUMNS;
 use crate::sql::{array_agg, canon_crate_name, lower};
-use crate::util::diesel::Conn;
+use crate::tasks::spawn_blocking;
+use crate::util::RequestUtils;
 
 /// Handles the `GET /crates` route.
 /// Returns a list of crates. Called in a variety of scenarios in the
@@ -43,34 +50,37 @@ use crate::util::diesel::Conn;
 pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
     let conn = app.db_read().await?;
     spawn_blocking(move || {
+        use diesel::RunQueryDsl;
+
         let conn: &mut AsyncConnectionWrapper<_> = &mut conn.into();
 
         use diesel::sql_types::Float;
         use seek::*;
 
         let params = req.query();
-        let option_param = |s| params.get(s).map(|v| v.as_str());
-        let sort = option_param("sort");
-        let include_yanked = option_param("include_yanked")
+        let option_param = |s| match params.get(s).map(|v| v.as_str()) {
+            Some(v) if v.contains('\0') => Err(bad_request(format!(
+                "parameter {s} cannot contain a null byte"
+            ))),
+            Some(v) => Ok(Some(v)),
+            None => Ok(None),
+        };
+        let sort = option_param("sort")?;
+        let include_yanked = option_param("include_yanked")?
             .map(|s| s == "yes")
             .unwrap_or(true);
 
-        // Remove 0x00 characters from the query string because Postgres can not
-        // handle them and will return an error, which would cause us to throw
-        // an Internal Server Error ourselves.
-        let q_string = option_param("q").map(|q| q.replace('\u{0}', ""));
-
         let filter_params = FilterParams {
-            q_string: q_string.as_deref(),
+            q_string: option_param("q")?,
             include_yanked,
-            category: option_param("category"),
-            all_keywords: option_param("all_keywords"),
-            keyword: option_param("keyword"),
-            letter: option_param("letter"),
-            user_id: option_param("user_id").and_then(|s| s.parse::<i32>().ok()),
-            team_id: option_param("team_id").and_then(|s| s.parse::<i32>().ok()),
-            following: option_param("following").is_some(),
-            has_ids: option_param("ids[]").is_some(),
+            category: option_param("category")?,
+            all_keywords: option_param("all_keywords")?,
+            keyword: option_param("keyword")?,
+            letter: option_param("letter")?,
+            user_id: option_param("user_id")?.and_then(|s| s.parse::<i32>().ok()),
+            team_id: option_param("team_id")?.and_then(|s| s.parse::<i32>().ok()),
+            following: option_param("following")?.is_some(),
+            has_ids: option_param("ids[]")?.is_some(),
             ..Default::default()
         };
 
@@ -80,6 +90,8 @@ pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
             crate_downloads::downloads,
             recent_crate_downloads::downloads.nullable(),
             0_f32.into_sql::<Float>(),
+            versions::num.nullable(),
+            versions::yanked.nullable(),
         );
 
         let mut seek: Option<Seek> = None;
@@ -87,9 +99,11 @@ pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
             .make_query(&req, conn)?
             .inner_join(crate_downloads::table)
             .left_join(recent_crate_downloads::table)
+            .left_join(default_versions::table)
+            .left_join(versions::table.on(default_versions::version_id.eq(versions::id)))
             .select(selection);
 
-        if let Some(q_string) = &q_string {
+        if let Some(q_string) = &filter_params.q_string {
             if !q_string.is_empty() {
                 let sort = sort.unwrap_or("relevance");
 
@@ -106,6 +120,8 @@ pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
                         crate_downloads::downloads,
                         recent_crate_downloads::downloads.nullable(),
                         rank.clone(),
+                        versions::num.nullable(),
+                        versions::yanked.nullable(),
                     ));
                     seek = Some(Seek::Relevance);
                     query = query.then_order_by(rank.desc())
@@ -116,6 +132,8 @@ pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
                         crate_downloads::downloads,
                         recent_crate_downloads::downloads.nullable(),
                         0_f32.into_sql::<Float>(),
+                        versions::num.nullable(),
+                        versions::yanked.nullable(),
                     ));
                     seek = Some(Seek::Query);
                 }
@@ -178,7 +196,7 @@ pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
                 pagination,
                 filter_params.make_query(&req, conn)?.count(),
             );
-            let data: Paginated<(Crate, bool, i64, Option<i64>, f32)> =
+            let data: Paginated<Record> =
                 info_span!("db.query", message = "SELECT ..., COUNT(*) FROM crates")
                     .in_scope(|| query.load(conn))?;
 
@@ -195,7 +213,7 @@ pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
                 pagination,
                 filter_params.make_query(&req, conn)?.count(),
             );
-            let data: Paginated<(Crate, bool, i64, Option<i64>, f32)> =
+            let data: Paginated<Record> =
                 info_span!("db.query", message = "SELECT ..., COUNT(*) FROM crates")
                     .in_scope(|| query.load(conn))?;
             (
@@ -207,37 +225,37 @@ pub async fn search(app: AppState, req: Parts) -> AppResult<Json<Value>> {
             )
         };
 
-        let perfect_matches = data.iter().map(|&(_, b, _, _, _)| b).collect::<Vec<_>>();
-        let downloads = data
-            .iter()
-            .map(|&(_, _, total, recent, _)| (total, recent.unwrap_or(0)))
-            .collect::<Vec<_>>();
-        let crates = data
-            .into_iter()
-            .map(|(c, _, _, _, _)| c)
-            .collect::<Vec<_>>();
+        let crates = data.iter().map(|(c, ..)| c).collect::<Vec<_>>();
 
         let versions: Vec<Version> = info_span!("db.query", message = "SELECT ... FROM versions")
-            .in_scope(|| crates.versions().load(conn))?;
+            .in_scope(|| {
+            Version::belonging_to(&crates)
+                .filter(versions::yanked.eq(false))
+                .load(conn)
+        })?;
         let versions = versions
             .grouped_by(&crates)
             .into_iter()
             .map(TopVersions::from_versions);
 
         let crates = versions
-            .zip(crates)
-            .zip(perfect_matches)
-            .zip(downloads)
-            .map(|(((max_version, krate), perfect_match), (total, recent))| {
-                EncodableCrate::from_minimal(
-                    krate,
-                    Some(&max_version),
-                    Some(vec![]),
-                    perfect_match,
-                    total,
-                    Some(recent),
-                )
-            })
+            .zip(data)
+            .map(
+                |(
+                    max_version,
+                    (krate, perfect_match, total, recent, _, default_version, yanked),
+                )| {
+                    EncodableCrate::from_minimal(
+                        krate,
+                        default_version.as_deref(),
+                        yanked,
+                        Some(&max_version),
+                        perfect_match,
+                        total,
+                        Some(recent.unwrap_or(0)),
+                    )
+                },
+            )
             .collect::<Vec<_>>();
 
         Ok(Json(json!({
@@ -286,12 +304,14 @@ impl<'a> FilterParams<'a> {
             .as_deref()
     }
 
-    fn authed_user_id(&self, req: &Parts, conn: &mut impl Conn) -> AppResult<i32> {
+    fn authed_user_id(&self, req: &Parts, conn: &mut AsyncPgConnection) -> AppResult<i32> {
         if let Some(val) = self._auth_user_id.get() {
             return Ok(*val);
         }
 
-        let user_id = AuthCheck::default().check(req, conn)?.user_id();
+        let user_id = Handle::current()
+            .block_on(AuthCheck::default().check(req, conn))?
+            .user_id();
 
         // This should not fail, because of the `get()` check above
         let _ = self._auth_user_id.set(user_id);
@@ -302,7 +322,7 @@ impl<'a> FilterParams<'a> {
     fn make_query(
         &'a self,
         req: &Parts,
-        conn: &mut impl Conn,
+        conn: &mut AsyncPgConnection,
     ) -> AppResult<crates::BoxedQuery<'a, diesel::pg::Pg>> {
         let mut query = crates::table.into_boxed();
 
@@ -564,6 +584,7 @@ impl<'a> FilterParams<'a> {
 }
 
 mod seek {
+    use super::Record;
     use crate::controllers::helpers::pagination::seek;
     use crate::models::Crate;
     use chrono::naive::serde::ts_microseconds;
@@ -604,10 +625,7 @@ mod seek {
     );
 
     impl Seek {
-        pub(crate) fn to_payload(
-            &self,
-            record: &(Crate, bool, i64, Option<i64>, f32),
-        ) -> SeekPayload {
+        pub(crate) fn to_payload(&self, record: &Record) -> SeekPayload {
             let (
                 Crate {
                     id,
@@ -619,6 +637,7 @@ mod seek {
                 downloads,
                 recent_downloads,
                 rank,
+                ..,
             ) = *record;
 
             match *self {
@@ -641,15 +660,31 @@ mod seek {
     }
 }
 
+type Record = (
+    Crate,
+    bool,
+    i64,
+    Option<i64>,
+    f32,
+    Option<String>,
+    Option<bool>,
+);
+
+type QuerySource = LeftJoinQuerySource<
+    LeftJoinQuerySource<
+        LeftJoinQuerySource<
+            InnerJoinQuerySource<crates::table, crate_downloads::table>,
+            recent_crate_downloads::table,
+        >,
+        default_versions::table,
+    >,
+    versions::table,
+    diesel::dsl::Eq<default_versions::version_id, versions::id>,
+>;
+
 type BoxedCondition<'a> = Box<
-    dyn BoxableExpression<
-            LeftJoinQuerySource<
-                InnerJoinQuerySource<crates::table, crate_downloads::table>,
-                recent_crate_downloads::table,
-            >,
-            diesel::pg::Pg,
-            SqlType = diesel::sql_types::Nullable<Bool>,
-        > + 'a,
+    dyn BoxableExpression<QuerySource, diesel::pg::Pg, SqlType = diesel::sql_types::Nullable<Bool>>
+        + 'a,
 >;
 
 diesel::infix_operator!(Contains, "@>");

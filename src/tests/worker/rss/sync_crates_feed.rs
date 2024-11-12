@@ -1,34 +1,28 @@
-use crate::util::TestApp;
+use crate::schema::crates;
+use crate::tests::util::TestApp;
+use crate::worker::jobs;
 use chrono::DateTime;
-use crates_io::schema::crates;
-use crates_io::worker::jobs;
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
-use diesel::{PgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use insta::assert_snapshot;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sync_crates_feed() {
     let (app, _) = TestApp::full().empty();
+    let mut conn = app.async_db_conn().await;
 
-    app.db(|conn| {
-        create_crate(
-            conn,
-            "foo",
-            Some("something something foo"),
-            "2024-06-20T10:13:54Z",
-        );
-        create_crate(conn, "bar", None, "2024-06-20T12:45:12Z");
-        create_crate(
-            conn,
-            "baz",
-            Some("does it handle XML? <item>"),
-            "2024-06-21T17:01:33Z",
-        );
-        create_crate(conn, "quux", None, "2024-06-21T17:03:45Z");
+    let description = Some("something something foo");
+    create_crate(&mut conn, "foo", description, "2024-06-20T10:13:54Z").await;
+    create_crate(&mut conn, "bar", None, "2024-06-20T12:45:12Z").await;
+    let description = Some("does it handle XML? <item>");
+    create_crate(&mut conn, "baz", description, "2024-06-21T17:01:33Z").await;
+    create_crate(&mut conn, "quux", None, "2024-06-21T17:03:45Z").await;
 
-        jobs::rss::SyncCratesFeed.enqueue(conn).unwrap();
-    });
+    jobs::rss::SyncCratesFeed
+        .async_enqueue(&mut conn)
+        .await
+        .unwrap();
 
     app.run_pending_background_jobs().await;
 
@@ -41,8 +35,8 @@ async fn test_sync_crates_feed() {
     assert_snapshot!(content);
 }
 
-fn create_crate(
-    conn: &mut PgConnection,
+async fn create_crate(
+    conn: &mut AsyncPgConnection,
     name: &str,
     description: Option<&str>,
     publish_time: &str,
@@ -59,5 +53,6 @@ fn create_crate(
             crates::updated_at.eq(publish_time),
         ))
         .execute(conn)
+        .await
         .unwrap();
 }
